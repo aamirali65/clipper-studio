@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+logs/*.log
+logs/*.log.*
+projects/*
+!projects/.gitkeep
+output/*
+!output/.gitkeep
+*.clipper
+.DS_Store
