@@ -177,6 +177,36 @@ class ClipRepository:
         self.db.execute("DELETE FROM clips WHERE id=?", (clip_id,))
         log.info("clip deleted id=%s", clip_id)
 
+    def restore(self, clip: Clip) -> Clip:
+        """Re-insert a clip preserving its original id (used by undo)."""
+        if clip.id is None:
+            return self.add(clip)
+        now = utc_now()
+        self.db.execute(
+            """
+            INSERT INTO clips (id, media_id, name, start_sec, end_sec, aspect,
+                               timeline_start, timeline_end, "order",
+                               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                clip.id,
+                clip.media_id,
+                clip.name,
+                clip.start,
+                clip.end,
+                clip.aspect,
+                clip.timeline_start,
+                clip.timeline_end,
+                clip.order,
+                clip.created_at or now,
+                now,
+            ),
+        )
+        clip.updated_at = now
+        log.info("clip restored: %s (id=%s)", clip.name, clip.id)
+        return clip
+
 
 class SettingsRepository:
     def __init__(self, db: ProjectDatabase):
@@ -291,6 +321,15 @@ class ProjectRepository:
                 (key, value),
             )
         base = project.directory
+        # remove rows deleted from the in-memory project so deletions persist
+        existing_media = {item.id for item in self.media_repo.list()}
+        kept_media = {item.id for item in project.media if item.id is not None}
+        for orphan in existing_media - kept_media:
+            self.media_repo.delete(orphan)
+        existing_clips = {clip.id for clip in self.clip_repo.list()}
+        kept_clips = {clip.id for clip in project.clips if clip.id is not None}
+        for orphan in existing_clips - kept_clips:
+            self.clip_repo.delete(orphan)
         for item in project.media:
             if item.id is None:
                 self.media_repo.add(item, base)

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, QUrl, Signal
+from PySide6.QtCore import QRectF, QElapsedTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -90,6 +91,7 @@ class VideoPlayer(QWidget):
         super().__init__(parent)
         self._duration_ms = 0
         self._seeking = False
+        self._pending_seek_ms: int | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -111,6 +113,7 @@ class VideoPlayer(QWidget):
         self.player.setAudioOutput(self.audio)
         self.player.positionChanged.connect(self._on_position)
         self.player.durationChanged.connect(self._on_duration)
+        self.player.mediaStatusChanged.connect(self._on_media_status)
         self.player.playbackStateChanged.connect(self._on_state)
         self.player.errorOccurred.connect(self._on_error)
 
@@ -244,6 +247,13 @@ class VideoPlayer(QWidget):
 
     def seek_ms(self, ms: int) -> None:
         ms = max(0, min(ms, self._duration_ms if self._duration_ms > 0 else ms))
+        ready = (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+            QMediaPlayer.MediaStatus.BufferingMedia,
+        )
+        if self.player.mediaStatus() not in ready:
+            self._pending_seek_ms = ms
         self.player.setPosition(ms)
         self._sync_slider(ms)
 
@@ -288,6 +298,32 @@ class VideoPlayer(QWidget):
         self.slider.setRange(0, max(0, ms))
         self.duration_label.setText(format_timecode(ms / 1000))
         self.durationChanged.emit(ms)
+
+    def _on_media_status(self, status) -> None:
+        if self._pending_seek_ms is None:
+            return
+        if status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            ms = self._pending_seek_ms
+            self._pending_seek_ms = None
+            self.player.setPosition(ms)
+
+    def wait_until_loaded(self, timeout_ms: int = 1500) -> bool:
+        """Spin the event loop until the media is ready (used by import flow)."""
+        ready = (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+        )
+        timer = QElapsedTimer()
+        timer.start()
+        while timer.elapsed() < timeout_ms:
+            if self.player.mediaStatus() in ready:
+                QApplication.processEvents()
+                return self.player.mediaStatus() == QMediaPlayer.MediaStatus.LoadedMedia
+            QApplication.processEvents()
+        return False
 
     def _on_state(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState

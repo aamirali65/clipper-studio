@@ -54,6 +54,8 @@ class Timeline(QWidget):
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
         self.duration = 0.0
+        self.position = 0.0
+        self.has_media = False
         self.clips: list[dict] = []  # [{id, media_id, name, timeline_start, timeline_end, order}]
         self.selected_clip_idx: int | None = None
         self.pps = DEFAULT_PPS
@@ -517,18 +519,14 @@ class Timeline(QWidget):
         event.accept()
 
     def _snap_time(self, time: float, clip_start: float, clip_end: float) -> dict:
-        """Snap timeline time to clip boundaries or grid."""
-        # Snap to nearest 0.5s grid, but not closer than MIN_CLIP_SECONDS
+        """Snap a clip's start position to the 0.5s grid, preserving its duration."""
         grid = 0.5
+        duration = max(MIN_CLIP_SECONDS, clip_end - clip_start)
         snapped = round(time / grid) * grid
-        snapped = max(MIN_CLIP_SECONDS, min(self.duration - MIN_CLIP_SECONDS, snapped))
-        # Ensure start < end and minimum duration
-        new_start = max(0.0, snapped - 0.5)
-        new_end = min(self.duration, snapped + 0.5)
-        # Clamp to not overlap other clips excessively (simple version)
-        new_start = max(0.0, min(new_start, clip_end - MIN_CLIP_SECONDS))
-        new_end = min(self.duration, max(new_end, clip_start + MIN_CLIP_SECONDS))
-        return {"start": new_start, "end": new_end}
+        if self.duration > 0:
+            snapped = min(snapped, self.duration - duration)
+        snapped = max(0.0, snapped)
+        return {"start": snapped, "end": snapped + duration}
 
     # ---- signals emulation for backward compat ----
     # The signals seekRequested, rangeEdited, rangeEditFinished are already defined

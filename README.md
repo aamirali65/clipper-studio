@@ -1,9 +1,23 @@
-# Clipper Studio
+<div align="center">
+  <img src="assets/logo.svg" alt="Clipper Studio logo" width="128">
+  <h1>Clipper Studio</h1>
+  <p>Local-first Windows desktop video clipper. Multi-clip timeline, real FFmpeg export, no paid APIs.</p>
+  <p>
+    <img src="https://img.shields.io/badge/platform-Windows-0078D6?style=flat-square">
+    <img src="https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square">
+    <img src="https://img.shields.io/badge/PySide6-6.x-41CD52?style=flat-square">
+    <img src="https://img.shields.io/badge/FFmpeg-6%2B-0078D6?style=flat-square">
+  </p>
+</div>
 
 Professional Windows desktop video clipping application. Local-first, no paid APIs.
 
 Phase 1 foundation: project system, media import (local + YouTube), real video
 playback, timeline trimming, and real FFmpeg export.
+
+Phase 2 timeline editor: multi-clip timeline with split, move, duplicate,
+delete, undo/redo, timeline-to-source mapping, and one-click export of every
+clip in a project.
 
 ## Requirements
 
@@ -70,7 +84,7 @@ Tests expect `output\sample_video.mp4`; it is generated automatically by
 ffmpeg -y -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" -f lavfi -i "sine=frequency=440:duration=30" -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest output\sample_video.mp4
 ```
 
-## Usage (Phase 1)
+## Usage (Phase 2)
 
 1. `File > New Project` (or dashboard **Create New Project**)
 2. **Import video** for a local file, or paste a YouTube URL and press
@@ -78,9 +92,17 @@ ffmpeg -y -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" -f lavfi -i "
 3. Double-click a media card to load it into the preview
 4. Trim: drag the timeline handles, or press `I` / `O` at the playhead, or
    type exact timecodes in the Inspector
-5. Pick an aspect ratio (16:9 / 9:16 / 1:1 / 4:5) - the preview shows the
+5. Build a sequence: **Add clip** in the editor page, drag clips on the
+   timeline to reorder, press `S` at the playhead to split, `Ctrl+D` to
+   duplicate, `Delete` to remove
+6. Undo / redo any edit with `Ctrl+Z` / `Ctrl+Shift+Z`
+7. Pick an aspect ratio (16:9 / 9:16 / 1:1 / 4:5) - the preview shows the
    framing mask
-6. **Export** - real FFmpeg trim + crop to a MP4 (H.264/AAC) with live progress
+8. **Export** one clip (`Ctrl+E`) or the whole project (`Ctrl+Shift+E`) -
+   real FFmpeg trim + crop to MP4 (H.264/AAC) with live progress
+
+Each clip keeps its own in/out range (source mapping) and timeline position,
+so what you see on the timeline is exactly what gets exported.
 
 ### Keyboard shortcuts
 
@@ -90,11 +112,15 @@ ffmpeg -y -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" -f lavfi -i "
 | Left / Right | Seek -5s / +5s |
 | Shift+Left / Shift+Right | Seek -1s / +1s |
 | I / O | Set in / out point |
+| S | Split selected clip at playhead |
+| Ctrl+D | Duplicate selected clip |
+| Delete | Remove selected clip or media |
+| Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 | Ctrl+N / Ctrl+O | New / open project |
 | Ctrl+S / Ctrl+Shift+S | Save / save as |
 | Ctrl+I | Import video |
-| Ctrl+E | Export clip |
-| Delete | Remove selected clip or media |
+| Ctrl+E | Export current clip |
+| Ctrl+Shift+E | Export all clips |
 | Mouse wheel | Timeline zoom |
 
 ## Project structure
@@ -110,7 +136,7 @@ clipper-studio/
 │   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / EXPORT nav
 │   │   ├── media_panel.py   # import + YouTube download + media cards
 │   │   ├── video_player.py  # QMediaPlayer preview + aspect framing overlay
-│   │   ├── timeline.py      # playhead, ruler, draggable in/out, zoom, seek
+│   │   ├── timeline.py      # multi-clip timeline: split/move/drag, zoom, undo support
 │   │   ├── inspector.py     # clip start/end/duration/aspect + validation
 │   │   ├── project_panel.py # project / editor / export pages
 │   │   ├── export_dialog.py # export options + progress + open folder
@@ -140,16 +166,15 @@ projects/MyPodcast/
 Paths inside the project are stored relative to the project folder, so a
 workspace can be moved as long as external media files are relocated too.
 
-## Known limitations (Phase 1)
+## Known limitations
 
 - Preview uses Qt Multimedia (WMF backend); exotic codecs (e.g. AV1, some
   VP9) may not play even though FFmpeg can export them. Convert or re-encode
   such files first.
 - Frame-exact stepping is not implemented; arrows seek 5s (1s with Shift).
-- Single video track with in/out trimming. Multi-clip timeline editing,
-  split/move/duplicate, and undo/redo belong to Phase 2.
-- Captions and AI sidebar entries are intentionally disabled - no fake
-  functionality is provided before Phase 4-5.
+- Single video track with multi-clip arrangement; audio tracks are not
+  editable. Captions and AI sidebar entries are intentionally disabled - no
+  fake functionality is provided before Phase 4-5.
 - Smart crop is center-crop; face/subject tracking is Phase 7.
 - YouTube download uses yt-dlp defaults (no cookies, no API key). Private or
   region-locked videos will fail with the reported yt-dlp error.
