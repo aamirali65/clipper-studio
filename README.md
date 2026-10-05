@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo.svg" alt="Clipper Studio logo" width="128">
+  <img src="assets/logo.png" alt="Clipper Studio logo" width="128">
   <h1>Clipper Studio</h1>
   <p>Local-first Windows desktop video clipper. Multi-clip timeline, real FFmpeg export, no paid APIs.</p>
   <p>
