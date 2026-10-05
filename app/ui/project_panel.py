@@ -207,6 +207,7 @@ class ExportPanel(QWidget):
     """EXPORT page: settings summary + entry point to the export dialog."""
 
     exportRequested = Signal()
+    queueRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -235,9 +236,16 @@ class ExportPanel(QWidget):
         self.export_button.clicked.connect(self.exportRequested)
         root.addWidget(self.export_button)
 
+        self.queue_button = QPushButton("Add to queue")
+        self.queue_button.setEnabled(False)
+        self.queue_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.queue_button.clicked.connect(self.queueRequested)
+        root.addWidget(self.queue_button)
+
         info = QLabel(
             "Export uses FFmpeg (H.264 + AAC in an MP4 container) and runs in "
-            "the background, so the UI stays responsive."
+            "the background, so the UI stays responsive. Queued jobs run "
+            "one at a time on the QUEUE page."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #4d4d55; font-size: 10px;")
@@ -246,6 +254,7 @@ class ExportPanel(QWidget):
 
     def refresh(self, clip: Clip | None, project: Project | None, aspect: str) -> None:
         self.export_button.setEnabled(clip is not None)
+        self.queue_button.setEnabled(clip is not None)
         if clip is None or project is None:
             self.summary.setText("No clip selected.")
             return

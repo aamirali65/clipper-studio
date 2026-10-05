@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -25,12 +24,14 @@ from PySide6.QtWidgets import (
 from app import APP_NAME
 from app.database.database import ProjectDatabase
 from app.database.repositories import ClipRepository, MediaRepository
-from app.models.clip import ASPECT_RATIOS, Clip
+from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, Clip
 from app.models.media import MediaItem, MediaKind, MediaProbeResult
 from app.models.project import Project, utc_now
-from app.services.export_service import ExportService
+from app.models.queue import JOB_RUNNING, ExportJob
+from app.services.export_queue import ExportQueueWorker
 from app.services.ffmpeg_service import FFmpegService
 from app.services.project_service import ProjectError, ProjectService
+from app.services.settings_service import SettingsService
 from app.services.youtube_service import InvalidYouTubeURL, YouTubeService
 from app.services.video_service import VideoService
 from app.ui.dashboard import ProjectDashboard
@@ -39,6 +40,8 @@ from app.ui.inspector import Inspector
 from app.ui.media_panel import MediaPanel
 from app.ui.project_dialog import NewProjectDialog
 from app.ui.project_panel import EditorPanel, ExportPanel, ProjectPanel
+from app.ui.queue_panel import QueuePanel
+from app.ui.settings_panel import SettingsPanel
 from app.ui.sidebar import Sidebar
 from app.ui.status_bar import StatusBar
 from app.ui.timeline import Timeline
@@ -55,6 +58,8 @@ PAGE_MEDIA = 0
 PAGE_PROJECT = 1
 PAGE_EDITOR = 2
 PAGE_EXPORT = 3
+PAGE_QUEUE = 4
+PAGE_SETTINGS = 5
 
 SEEK_STEP_SECONDS = 5.0
 MIN_CLIP_SECONDS = 0.05
@@ -65,39 +70,9 @@ PAGE_INDEX = {
     "project": PAGE_PROJECT,
     "editor": PAGE_EDITOR,
     "export": PAGE_EXPORT,
+    "queue": PAGE_QUEUE,
+    "settings": PAGE_SETTINGS,
 }
-
-
-class MultiExportWorker(QThread):
-    """Exports every clip in a project off the UI thread."""
-
-    progress = Signal(float, str)
-    completed = Signal(object)
-    error = Signal(str)
-
-    def __init__(self, project: Project, clips: list[Clip], parent=None):
-        super().__init__(parent)
-        self._project = project
-        self._clips = list(clips)
-        self._cancel = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancel.set()
-
-    def run(self) -> None:
-        try:
-            service = ExportService()
-            paths = service.export_multi_clips(
-                self._project,
-                self._clips,
-                progress_cb=lambda p, d: self.progress.emit(float(p), d),
-                cancel_event=self._cancel,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("export-all failed")
-            self.error.emit(str(exc))
-        else:
-            self.completed.emit([str(p) for p in paths])
 
 
 class MainWindow(QMainWindow):
@@ -108,6 +83,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
 
         self.project_service = ProjectService()
+        self.settings_service = SettingsService()
         self.ffmpeg = FFmpegService()
         self.video_service = VideoService(self.ffmpeg)
         self.youtube_service = YouTubeService(self.video_service, self.ffmpeg)
@@ -120,7 +96,6 @@ class MainWindow(QMainWindow):
         self._bg_workers: list[QThread] = []
         self._download_worker: DownloadWorker | None = None
         self._metadata_worker: MetadataWorker | None = None
-        self._export_multi_worker: MultiExportWorker | None = None
         self._export_dialog: ExportDialog | None = None
         self._pending_probe_count = 0
         self._undo_stack: list[dict] = []
@@ -128,6 +103,12 @@ class MainWindow(QMainWindow):
         self._trim_snapshot: dict | None = None
         self._move_snapshot: dict | None = None
         self._committed_range: tuple[float, float] | None = None
+
+        self.queue_worker = ExportQueueWorker(self)
+        self.queue_worker.jobAdded.connect(self._on_queue_added)
+        self.queue_worker.jobUpdated.connect(self._on_queue_changed)
+        self.queue_worker.jobsCleared.connect(self._on_queue_changed)
+        self.queue_worker.queueEmpty.connect(self._on_queue_empty)
 
         self._build_menu()
         self._build_central()
@@ -199,6 +180,8 @@ class MainWindow(QMainWindow):
         self.project_panel = ProjectPanel()
         self.editor_panel = EditorPanel()
         self.export_panel = ExportPanel()
+        self.queue_panel = QueuePanel()
+        self.settings_panel = SettingsPanel(self.settings_service)
         self.player = VideoPlayer()
         self.timeline = Timeline()
         self.inspector = Inspector()
@@ -224,10 +207,12 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.setMinimumWidth(296)
         self.pages.setMaximumWidth(360)
-        self.pages.addWidget(self.media_panel)    # PAGE_MEDIA
-        self.pages.addWidget(self.project_panel)  # PAGE_PROJECT
-        self.pages.addWidget(self.editor_panel)   # PAGE_EDITOR
-        self.pages.addWidget(self.export_panel)   # PAGE_EXPORT
+        self.pages.addWidget(self.media_panel)     # PAGE_MEDIA
+        self.pages.addWidget(self.project_panel)   # PAGE_PROJECT
+        self.pages.addWidget(self.editor_panel)    # PAGE_EDITOR
+        self.pages.addWidget(self.export_panel)    # PAGE_EXPORT
+        self.pages.addWidget(self.queue_panel)     # PAGE_QUEUE
+        self.pages.addWidget(self.settings_panel)  # PAGE_SETTINGS
         columns.addWidget(self.pages)
 
         center = QVBoxLayout()
@@ -292,6 +277,17 @@ class MainWindow(QMainWindow):
         self.editor_panel.removeClipRequested.connect(self._remove_clip_by_id)
 
         self.export_panel.exportRequested.connect(self.open_export_dialog)
+        self.export_panel.queueRequested.connect(self._queue_current_clip)
+
+        self.queue_panel.cancelRequested.connect(self.queue_worker.cancel_job)
+        self.queue_panel.cancelAllRequested.connect(self.queue_worker.cancel_all)
+        self.queue_panel.clearRequested.connect(self.queue_worker.clear_finished)
+        self.queue_panel.openFolderRequested.connect(self._open_queue_output_folder)
+
+        self.settings_panel.settingsSaved.connect(self._on_settings_saved)
+        self.settings_panel.openOutputFolderRequested.connect(
+            self._open_default_output_folder
+        )
 
     def _build_shortcuts(self) -> None:
         def add(key: str, slot, name: str) -> None:
@@ -336,6 +332,10 @@ class MainWindow(QMainWindow):
             self.export_panel.refresh(
                 self.current_clip, self.project, self.status_bar.aspect
             )
+        elif key == "queue":
+            self.queue_panel.refresh(self.queue_worker.jobs_snapshot())
+        elif key == "settings":
+            self.settings_panel.load_values()
         elif key == "media":
             if len(self.media_panel.items()) != len(self.project.media):
                 self.media_panel.set_media(self.project.media)
@@ -348,6 +348,15 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             project = dialog.result_project
             if project is not None:
+                defaults = self.settings_service.settings
+                if defaults.default_aspect in ASPECT_RATIOS:
+                    project.editor_settings.aspect = defaults.default_aspect
+                if defaults.default_preset in QUALITY_PRESETS:
+                    project.export_settings.preset = defaults.default_preset
+                    project.export_settings.crf = QUALITY_PRESETS[
+                        defaults.default_preset
+                    ]["crf"]
+                self.project_service.save_project(project)
                 self._load_project(project, "Project created")
 
     def open_project_dialog(self) -> None:
@@ -1419,10 +1428,42 @@ class MainWindow(QMainWindow):
         if self._export_dialog is not None and self._export_dialog.isVisible():
             self._export_dialog.raise_()
             return
-        dialog = ExportDialog(self.project, self.current_clip, media, self)
+        dialog = ExportDialog(
+            self.project,
+            self.current_clip,
+            media,
+            self,
+            output_dir=self.settings_service.settings.output_dir,
+        )
         self._export_dialog = dialog
         dialog.exec()
         self._export_dialog = None
+
+    # -------------------------------------------------------------- queue
+    def _enqueue_clips(self, clips: list[Clip]) -> int:
+        if self.project is None:
+            return 0
+        output_dir = self.settings_service.settings.output_dir
+        count = 0
+        for clip in clips:
+            job = self.queue_worker.enqueue_clip(
+                self.project, clip, output_dir=output_dir
+            )
+            if job is not None:
+                count += 1
+        return count
+
+    def _queue_current_clip(self) -> None:
+        if not self._require_project():
+            return
+        if self.current_clip is None:
+            self._push_status("Select a clip first")
+            return
+        self._sync_settings()
+        clip_name = self.current_clip.name
+        if self._enqueue_clips([self.current_clip]):
+            self.sidebar.select("queue")
+            self._push_status(f"Queued {clip_name}")
 
     def _export_all_clips(self) -> None:
         if not self._require_project():
@@ -1430,51 +1471,75 @@ class MainWindow(QMainWindow):
         if not self.project.clips:
             self._push_status("No clips to export")
             return
-        if self._export_multi_worker is not None and self._export_multi_worker.isRunning():
-            self._push_status("An export is already running")
-            return
         self._sync_settings()
-        if not self.save_project():
+        clips = self._clips_from_project()
+        count = self._enqueue_clips(clips)
+        self.sidebar.select("queue")
+        self._push_status(f"Queued {count} clips")
+
+    def _on_queue_added(self, job: ExportJob) -> None:
+        self.queue_panel.refresh(self.queue_worker.jobs_snapshot())
+        if job.status == "error":
+            self._push_status(f"Could not queue {job.clip_name}: {job.error}")
+
+    def _on_queue_changed(self, _job=None) -> None:
+        jobs = self.queue_worker.jobs_snapshot()
+        self.queue_panel.refresh(jobs)
+        running = next((job for job in jobs if job.status == JOB_RUNNING), None)
+        if running is not None:
+            self._push_status(
+                f"Exporting {running.clip_name}  -  "
+                f"{int(running.progress * 100)}%  -  {running.detail}"
+            )
+
+    def _on_queue_empty(self, done: int, errors: int) -> None:
+        if done == 0 and errors == 0:
             return
-
-        self._push_status(
-            f"Exporting {len(self.project.clips)} clips...  0%"
-        )
-        self.status_bar.set_export_enabled(False)
-        worker = MultiExportWorker(self.project, self.project.clips, self)
-        worker.progress.connect(self._on_export_all_progress)
-        worker.completed.connect(self._on_export_all_completed)
-        worker.error.connect(self._on_export_all_error)
-        self._export_multi_worker = worker
-        self._track_worker(worker)
-        worker.start()
-
-    def _on_export_all_progress(self, progress: float, detail: str) -> None:
-        percent = int(max(0.0, min(100.0, progress)))
-        self._push_status(f"Exporting...  {percent}%  -  {detail}")
-
-    def _on_export_all_completed(self, paths: list) -> None:
-        self._export_multi_worker = None
-        self.status_bar.set_export_enabled(True)
-        count = len(paths)
-        self._push_status(f"Exported {count} clip{'s' if count != 1 else ''}")
-        if paths:
+        parts = []
+        if done:
+            parts.append(f"{done} exported")
+        if errors:
+            parts.append(f"{errors} failed")
+        message = "Queue finished: " + ", ".join(parts)
+        self._push_status(message)
+        log.info(message)
+        if done:
             reply = QMessageBox.question(
                 self,
-                "Export All",
-                f"Exported {count} clips.\n\nOpen the output folder?",
+                "Export Queue",
+                f"Exported {done} clip{'s' if done != 1 else ''}.\n\n"
+                "Open the output folder?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
             if reply == QMessageBox.StandardButton.Yes:
-                open_in_explorer(Path(paths[0]).parent)
-        log.info("export-all finished: %s", [str(p) for p in paths])
+                self._open_queue_output_folder()
 
-    def _on_export_all_error(self, message: str) -> None:
-        self._export_multi_worker = None
-        self.status_bar.set_export_enabled(True)
-        self._push_status(f"Export failed: {message}")
-        QMessageBox.warning(self, "Export All", message)
+    def _open_queue_output_folder(self) -> None:
+        for job in reversed(self.queue_worker.jobs_snapshot()):
+            target = Path(job.output)
+            if job.status == "done" and target.exists():
+                open_in_explorer(target)
+                return
+        if self.project is not None:
+            open_in_explorer(self.project.exports_dir)
+        else:
+            self._push_status("No exports yet")
+
+    def _open_default_output_folder(self) -> None:
+        target = self.settings_service.settings.output_dir
+        if target and Path(target).exists():
+            open_in_explorer(Path(target))
+        elif self.project is not None:
+            open_in_explorer(self.project.exports_dir)
+        else:
+            self._push_status("No output folder yet")
+
+    def _on_settings_saved(self, settings) -> None:
+        self._push_status(
+            f"Settings saved  -  {settings.default_aspect}  ·  "
+            f"{settings.default_preset}"
+        )
 
     # ------------------------------------------------------------ guards
     def _typing_focus(self) -> bool:
@@ -1566,12 +1631,10 @@ class MainWindow(QMainWindow):
         if self._download_worker is not None and self._download_worker.isRunning():
             self._download_worker.cancel()
             self._download_worker.wait(2000)
-        if self._export_multi_worker is not None and self._export_multi_worker.isRunning():
-            self._export_multi_worker.cancel()
-            self._export_multi_worker.wait(3000)
         if not self._confirm_discard():
             event.ignore()
             return
+        self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():
                 worker.terminate()

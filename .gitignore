@@ -13,4 +13,5 @@ projects/*
 output/*
 !output/.gitkeep
 *.clipper
+settings.json
 .DS_Store

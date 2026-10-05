@@ -36,6 +36,7 @@ class ExportDialog(QDialog):
         clip: Clip,
         media: MediaItem,
         parent=None,
+        output_dir: str = "",
     ):
         super().__init__(parent)
         self.setWindowTitle("Export Clip")
@@ -43,6 +44,7 @@ class ExportDialog(QDialog):
         self._project = project
         self._clip = clip
         self._media = media
+        self._output_dir = output_dir.strip()
         self._worker: ExportWorker | None = None
         self._output: Path | None = None
 
@@ -164,7 +166,12 @@ class ExportDialog(QDialog):
         clip_name = self._clip.name or "clip"
         if media:
             clip_name = f"{Path(media.name).stem} - {clip_name}"
-        return self._project.exports_dir / f"{base} - {clip_name}.mp4"
+        directory = (
+            Path(self._output_dir)
+            if self._output_dir
+            else self._project.exports_dir
+        )
+        return directory / f"{base} - {clip_name}.mp4"
 
     def _refresh_resolution(self) -> None:
         aspect = self.aspect_box.currentData() or "9:16"

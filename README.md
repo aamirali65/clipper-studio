@@ -19,6 +19,10 @@ Phase 2 timeline editor: multi-clip timeline with split, move, duplicate,
 delete, undo/redo, timeline-to-source mapping, and one-click export of every
 clip in a project.
 
+Phase 3 export queue + settings: background export queue with per-job
+progress, cancel/clear controls, and a SETTINGS page for global defaults
+(aspect, quality preset, output folder) persisted in `settings.json`.
+
 ## Requirements
 
 - Windows 10/11
@@ -72,9 +76,10 @@ python main.py --smoke 4000
 ## Tests
 
 ```powershell
-python tests\test_pipeline.py   # timecode, probe, project SQLite, FFmpeg export (3 aspect ratios)
-python tests\test_youtube.py    # YouTube URL validation
-python tests\test_gui.py        # full GUI flow: project -> import -> trim -> save -> reopen -> export
+python tests\test_pipeline.py        # timecode, probe, project SQLite, FFmpeg export (3 aspect ratios)
+python tests\test_youtube.py         # YouTube URL validation
+python tests\test_gui.py             # full GUI flow: project -> import -> trim -> save -> reopen -> export
+python tests\test_queue_settings.py  # export queue worker + settings persistence
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -98,8 +103,12 @@ ffmpeg -y -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" -f lavfi -i "
 6. Undo / redo any edit with `Ctrl+Z` / `Ctrl+Shift+Z`
 7. Pick an aspect ratio (16:9 / 9:16 / 1:1 / 4:5) - the preview shows the
    framing mask
-8. **Export** one clip (`Ctrl+E`) or the whole project (`Ctrl+Shift+E`) -
-   real FFmpeg trim + crop to MP4 (H.264/AAC) with live progress
+8. **Export** one clip (`Ctrl+E`), or send it to the **queue** from the
+   EXPORT page, or queue the whole project (`Ctrl+Shift+E`) - real FFmpeg
+   trim + crop to MP4 (H.264/AAC) with live per-job progress on the QUEUE
+   page while you keep editing
+9. Set global defaults (new-project aspect, quality preset, export output
+   folder) on the SETTINGS page
 
 Each clip keeps its own in/out range (source mapping) and timeline position,
 so what you see on the timeline is exactly what gets exported.
@@ -139,18 +148,23 @@ clipper-studio/
 │   │   ├── timeline.py      # multi-clip timeline: split/move/drag, zoom, undo support
 │   │   ├── inspector.py     # clip start/end/duration/aspect + validation
 │   │   ├── project_panel.py # project / editor / export pages
+│   │   ├── queue_panel.py   # QUEUE page: background export jobs + progress
+│   │   ├── settings_panel.py# SETTINGS page: global defaults
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
 │   │   ├── status_bar.py    # timecode, aspect, export button
 │   │   └── theme.py         # dark stylesheet
 │   ├── services/            # FFmpegService, VideoService, YouTubeService,
-│   │                        # ExportService, ProjectService
+│   │                        # ExportService, ExportQueueWorker, SettingsService,
+│   │                        # ProjectService
 │   ├── database/            # database.py (SQLite schema) + repositories.py (all SQL)
-│   ├── models/              # Pydantic: Project, MediaItem, Clip, settings
+│   ├── models/              # Pydantic: Project, MediaItem, Clip, ExportJob,
+│   │                        # AppSettings, settings
 │   ├── workers/             # QThread: probe, download, metadata, export
 │   └── utils/               # paths, logging, ffmpeg discovery, timecode
 ├── tests/
 ├── projects/                # workspaces: <name>/media, thumbnails, exports, cache, <name>.clipper
+├── settings.json            # global defaults (created after first save)
 ├── logs/clipper.log
 └── output/
 ```
@@ -175,6 +189,9 @@ workspace can be moved as long as external media files are relocated too.
 - Single video track with multi-clip arrangement; audio tracks are not
   editable. Captions and AI sidebar entries are intentionally disabled - no
   fake functionality is provided before Phase 4-5.
+- The export queue is session-scoped: queued jobs are not persisted across
+  app restarts. Settings (aspect/preset/output folder) live in
+  `settings.json` next to the app.
 - Smart crop is center-crop; face/subject tracking is Phase 7.
 - YouTube download uses yt-dlp defaults (no cookies, no API key). Private or
   region-locked videos will fail with the reported yt-dlp error.

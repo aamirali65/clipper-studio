@@ -50,6 +50,13 @@ def log_file_path() -> Path:
     return logs_dir() / "clipper.log"
 
 
+def settings_path() -> Path:
+    override = os.environ.get("CLIPPER_SETTINGS_FILE")
+    if override:
+        return Path(override)
+    return app_root() / "settings.json"
+
+
 def safe_name(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name.strip())
     cleaned = cleaned.strip(". ")
