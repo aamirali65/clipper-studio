@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.models.caption import LANGUAGES, WHISPER_MODELS
 from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, resolution_for
 from app.models.settings import AppSettings
 from app.services.settings_service import SettingsService
@@ -111,6 +113,34 @@ class SettingsPanel(QWidget):
 
         root.addWidget(out_card)
 
+        # ---- captions card ----
+        cap_card = QFrame()
+        cap_card.setStyleSheet(
+            "QFrame { background-color: #16161b; border: 1px solid #2a2a32;"
+            " border-radius: 8px; }"
+        )
+        cap_layout = QVBoxLayout(cap_card)
+        cap_layout.setContentsMargins(12, 12, 12, 12)
+        cap_layout.setSpacing(10)
+
+        cap_layout.addWidget(caption("Whisper model (captions)"))
+        self.model_box = QComboBox()
+        for key, label in WHISPER_MODELS.items():
+            self.model_box.addItem(label, key)
+        cap_layout.addWidget(self.model_box)
+
+        cap_layout.addWidget(caption("Caption language"))
+        self.language_box = QComboBox()
+        for code, label in LANGUAGES.items():
+            self.language_box.addItem(label, code)
+        cap_layout.addWidget(self.language_box)
+
+        self.burn_box = QCheckBox("Burn captions into exports when available")
+        self.burn_box.setStyleSheet("color: #83838d;")
+        cap_layout.addWidget(self.burn_box)
+
+        root.addWidget(cap_card)
+
         # ---- save row ----
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -142,12 +172,20 @@ class SettingsPanel(QWidget):
         preset_index = self.preset_box.findData(settings.default_preset)
         self.preset_box.setCurrentIndex(preset_index if preset_index >= 0 else 1)
         self.path_edit.setText(settings.output_dir)
+        model_index = self.model_box.findData(settings.whisper_model)
+        self.model_box.setCurrentIndex(model_index if model_index >= 0 else 1)
+        language_index = self.language_box.findData(settings.whisper_language)
+        self.language_box.setCurrentIndex(language_index if language_index >= 0 else 0)
+        self.burn_box.setChecked(bool(settings.burn_captions))
 
     def _save(self) -> None:
         settings = AppSettings(
             default_aspect=self.aspect_box.currentData() or "9:16",
             default_preset=self.preset_box.currentData() or "balanced",
             output_dir=self.path_edit.text().strip(),
+            whisper_model=self.model_box.currentData() or "base",
+            whisper_language=self.language_box.currentData() or "auto",
+            burn_captions=self.burn_box.isChecked(),
         )
         if settings.output_dir:
             target = Path(settings.output_dir)

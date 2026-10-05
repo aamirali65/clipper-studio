@@ -56,6 +56,7 @@ class ExportQueueWorker(QThread):
         clip: Clip,
         output_dir: str = "",
         settings: ExportSettings | None = None,
+        captions_srt: Path | str = "",
         autostart: bool = True,
     ) -> ExportJob:
         media = project.media_by_id(clip.media_id)
@@ -94,6 +95,7 @@ class ExportQueueWorker(QThread):
                 preset=settings.preset,
                 crf=settings.crf,
                 pixel_format=settings.pixel_format,
+                subtitles_path=str(captions_srt) if captions_srt else "",
                 project_name=project.name,
                 project_path=str(project.path),
             )
@@ -229,6 +231,7 @@ class ExportQueueWorker(QThread):
             settings=ExportSettings(
                 preset=job.preset, crf=job.crf, pixel_format=job.pixel_format
             ),
+            subtitles=Path(job.subtitles_path) if job.subtitles_path else None,
         )
         last_emit = -1.0
 

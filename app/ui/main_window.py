@@ -23,17 +23,19 @@ from PySide6.QtWidgets import (
 
 from app import APP_NAME
 from app.database.database import ProjectDatabase
-from app.database.repositories import ClipRepository, MediaRepository
+from app.database.repositories import CaptionRepository, ClipRepository, MediaRepository
 from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, Clip
 from app.models.media import MediaItem, MediaKind, MediaProbeResult
 from app.models.project import Project, utc_now
 from app.models.queue import JOB_RUNNING, ExportJob
+from app.services.caption_service import whisper_available, write_srt
 from app.services.export_queue import ExportQueueWorker
 from app.services.ffmpeg_service import FFmpegService
 from app.services.project_service import ProjectError, ProjectService
 from app.services.settings_service import SettingsService
 from app.services.youtube_service import InvalidYouTubeURL, YouTubeService
 from app.services.video_service import VideoService
+from app.ui.captions_panel import CaptionsPanel
 from app.ui.dashboard import ProjectDashboard
 from app.ui.export_dialog import ExportDialog
 from app.ui.inspector import Inspector
@@ -47,10 +49,17 @@ from app.ui.status_bar import StatusBar
 from app.ui.timeline import Timeline
 from app.ui.video_player import VideoPlayer
 from app.utils.logging import get_logger
-from app.utils.paths import format_bytes, open_in_explorer, projects_dir, safe_name
+from app.utils.paths import (
+    cache_dir,
+    format_bytes,
+    open_in_explorer,
+    projects_dir,
+    safe_name,
+)
 from app.utils.timecode import format_clock, format_timecode
 from app.workers.download_worker import DownloadWorker, MetadataWorker
 from app.workers.probe_worker import ProbeWorker
+from app.workers.transcribe_worker import TranscribeWorker
 
 log = get_logger("main_window")
 
@@ -60,6 +69,7 @@ PAGE_EDITOR = 2
 PAGE_EXPORT = 3
 PAGE_QUEUE = 4
 PAGE_SETTINGS = 5
+PAGE_CAPTIONS = 6
 
 SEEK_STEP_SECONDS = 5.0
 MIN_CLIP_SECONDS = 0.05
@@ -72,6 +82,7 @@ PAGE_INDEX = {
     "export": PAGE_EXPORT,
     "queue": PAGE_QUEUE,
     "settings": PAGE_SETTINGS,
+    "captions": PAGE_CAPTIONS,
 }
 
 
@@ -103,6 +114,8 @@ class MainWindow(QMainWindow):
         self._trim_snapshot: dict | None = None
         self._move_snapshot: dict | None = None
         self._committed_range: tuple[float, float] | None = None
+        self._transcribe_worker: TranscribeWorker | None = None
+        self._transcribe_clip_id: int | None = None
 
         self.queue_worker = ExportQueueWorker(self)
         self.queue_worker.jobAdded.connect(self._on_queue_added)
@@ -182,6 +195,7 @@ class MainWindow(QMainWindow):
         self.export_panel = ExportPanel()
         self.queue_panel = QueuePanel()
         self.settings_panel = SettingsPanel(self.settings_service)
+        self.captions_panel = CaptionsPanel()
         self.player = VideoPlayer()
         self.timeline = Timeline()
         self.inspector = Inspector()
@@ -213,6 +227,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.export_panel)    # PAGE_EXPORT
         self.pages.addWidget(self.queue_panel)     # PAGE_QUEUE
         self.pages.addWidget(self.settings_panel)  # PAGE_SETTINGS
+        self.pages.addWidget(self.captions_panel)  # PAGE_CAPTIONS
         columns.addWidget(self.pages)
 
         center = QVBoxLayout()
@@ -289,6 +304,12 @@ class MainWindow(QMainWindow):
             self._open_default_output_folder
         )
 
+        self.captions_panel.transcribeRequested.connect(self._start_transcription)
+        self.captions_panel.cancelRequested.connect(self._cancel_transcription)
+        self.captions_panel.exportSrtRequested.connect(self._on_caption_export_srt)
+        self.captions_panel.clearRequested.connect(self._on_caption_clear)
+        self.captions_panel.segmentEdited.connect(self._on_caption_segment_edited)
+
     def _build_shortcuts(self) -> None:
         def add(key: str, slot, name: str) -> None:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -336,6 +357,8 @@ class MainWindow(QMainWindow):
             self.queue_panel.refresh(self.queue_worker.jobs_snapshot())
         elif key == "settings":
             self.settings_panel.load_values()
+        elif key == "captions":
+            self._refresh_captions_panel()
         elif key == "media":
             if len(self.media_panel.items()) != len(self.project.media):
                 self.media_panel.set_media(self.project.media)
@@ -490,6 +513,13 @@ class MainWindow(QMainWindow):
 
         self.project_panel.refresh(project)
         self.dashboard.set_projects(self.project_service.recent_projects())
+
+        defaults = self.settings_service.settings
+        self.captions_panel.set_whisper_available(whisper_available())
+        self.captions_panel.set_model_value(defaults.whisper_model)
+        self.captions_panel.set_language_value(defaults.whisper_language)
+        self._refresh_captions_panel()
+
         self._push_status(message or f"Opened {project.name}")
         log.info("project loaded into window: %s", project.name)
 
@@ -992,6 +1022,8 @@ class MainWindow(QMainWindow):
             self.status_bar.set_aspect(clip.aspect)
             self.export_panel.refresh(clip, self.project, clip.aspect)
             self._committed_range = (clip.start, clip.end)
+        if self.pages.currentIndex() == PAGE_CAPTIONS:
+            self._refresh_captions_panel()
         self._push_status(f"Selected {clip.name}")
 
     def _on_clip_selected(self, clip_id: int) -> None:
@@ -1428,12 +1460,15 @@ class MainWindow(QMainWindow):
         if self._export_dialog is not None and self._export_dialog.isVisible():
             self._export_dialog.raise_()
             return
+        captions_srt = self._write_clip_srt(self.current_clip)
         dialog = ExportDialog(
             self.project,
             self.current_clip,
             media,
             self,
             output_dir=self.settings_service.settings.output_dir,
+            captions_srt=captions_srt,
+            burn_captions=self.settings_service.settings.burn_captions,
         )
         self._export_dialog = dialog
         dialog.exec()
@@ -1444,10 +1479,15 @@ class MainWindow(QMainWindow):
         if self.project is None:
             return 0
         output_dir = self.settings_service.settings.output_dir
+        burn = self.settings_service.settings.burn_captions
         count = 0
         for clip in clips:
+            captions_srt = self._write_clip_srt(clip) if burn else None
             job = self.queue_worker.enqueue_clip(
-                self.project, clip, output_dir=output_dir
+                self.project,
+                clip,
+                output_dir=output_dir,
+                captions_srt=captions_srt or "",
             )
             if job is not None:
                 count += 1
@@ -1536,10 +1576,195 @@ class MainWindow(QMainWindow):
             self._push_status("No output folder yet")
 
     def _on_settings_saved(self, settings) -> None:
+        self.captions_panel.set_model_value(settings.whisper_model)
+        self.captions_panel.set_language_value(settings.whisper_language)
         self._push_status(
             f"Settings saved  -  {settings.default_aspect}  ·  "
             f"{settings.default_preset}"
         )
+
+    # ----------------------------------------------------------- captions
+    def _load_captions(self, clip_id: int | None) -> list:
+        if clip_id is None:
+            return []
+        database = ProjectDatabase(self.project.path)
+        try:
+            return CaptionRepository(database).for_clip(clip_id)
+        finally:
+            database.close()
+
+    def _refresh_captions_panel(self) -> None:
+        clip = self.current_clip
+        media_name = ""
+        if self.project is not None and clip is not None:
+            media = self.project.media_by_id(clip.media_id)
+            media_name = media.name if media else ""
+        self.captions_panel.set_clip(clip, media_name)
+        if clip is None or clip.id is None:
+            self.captions_panel.set_segments([])
+            return
+        self.captions_panel.set_segments(self._load_captions(clip.id))
+
+    def _start_transcription(self) -> None:
+        if not self._require_project() or self.current_clip is None:
+            return
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            self._push_status("Transcription is already running")
+            return
+        if not whisper_available():
+            self.captions_panel.set_status(
+                "faster-whisper is not installed - run: "
+                "python -m pip install faster-whisper",
+                error=True,
+            )
+            return
+        clip = self.current_clip
+        media = self.project.media_by_id(clip.media_id)
+        if media is None:
+            self._push_status("Clip's media is missing from the project")
+            return
+        source = media.resolve_path(self.project.directory)
+        if not source.exists():
+            source = Path(media.source_path)
+        if not source.exists():
+            self.captions_panel.set_status(
+                f"Source file not found: {media.source_path}", error=True
+            )
+            return
+
+        worker = TranscribeWorker(
+            source,
+            clip.start,
+            clip.end,
+            model_name=self.captions_panel.selected_model(),
+            language=self.captions_panel.selected_language(),
+            download_root=cache_dir() / "whisper",
+            ffmpeg=self.ffmpeg,
+            parent=self,
+        )
+        worker.progress.connect(self._on_transcribe_progress)
+        worker.completed.connect(self._on_transcribe_completed)
+        worker.error.connect(self._on_transcribe_error)
+        self._transcribe_worker = worker
+        self._transcribe_clip_id = clip.id
+        self._track_worker(worker)
+        self.captions_panel.set_busy(True)
+        self.captions_panel.set_status(
+            f"Transcribing {clip.name} with "
+            f"'{self.captions_panel.selected_model()}' model…"
+        )
+        worker.start()
+
+    def _cancel_transcription(self) -> None:
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            self._transcribe_worker.cancel()
+            self.captions_panel.set_status("Cancelling…")
+
+    def _on_transcribe_progress(self, message: str) -> None:
+        self.captions_panel.set_status(message)
+
+    def _on_transcribe_completed(self, segments, language: str) -> None:
+        self.captions_panel.set_busy(False)
+        if self.project is None:
+            return
+        clip_id = self._transcribe_clip_id
+        self._transcribe_clip_id = None
+        if clip_id is None or self.project.clip_by_id(clip_id) is None:
+            self.captions_panel.set_status(
+                "Clip no longer exists - result discarded", error=True
+            )
+            return
+        if not segments:
+            existing = self._load_captions(clip_id)
+            self.captions_panel.set_segments(existing)
+            message = "No speech detected"
+            if existing:
+                message += f" (kept {len(existing)} existing segments)"
+            self.captions_panel.set_status(message)
+            return
+        database = ProjectDatabase(self.project.path)
+        try:
+            saved = CaptionRepository(database).replace_for_clip(
+                clip_id, list(segments)
+            )
+        finally:
+            database.close()
+        self.captions_panel.set_segments(saved)
+        lang = f" · {language}" if language else ""
+        self.captions_panel.set_status(f"Transcribed {len(saved)} segments{lang}")
+        self._push_status(f"Captions ready for {self.current_clip.name if self.current_clip else 'clip'}")
+        if self.pages.currentIndex() != PAGE_CAPTIONS:
+            self.sidebar.select("captions")
+
+    def _on_transcribe_error(self, message: str) -> None:
+        self.captions_panel.set_busy(False)
+        self.captions_panel.set_status(message, error=True)
+        self._push_status(f"Transcription failed: {message}")
+
+    def _on_caption_export_srt(self) -> None:
+        if not self._require_project() or self.current_clip is None:
+            return
+        segments = self.captions_panel.segments
+        if not segments:
+            self._push_status("No captions to export")
+            return
+        clip = self.current_clip
+        default = self.project.exports_dir / f"{safe_name(clip.name)}.srt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export SRT", str(default), "SubRip subtitles (*.srt)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".srt"):
+            path += ".srt"
+        write_srt(segments, path)
+        self._push_status(f"Saved {path}")
+
+    def _on_caption_clear(self) -> None:
+        if not self._require_project() or self.current_clip is None:
+            return
+        if not self.captions_panel.segments:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear Captions",
+            "Delete all captions for this clip?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        database = ProjectDatabase(self.project.path)
+        try:
+            CaptionRepository(database).delete_for_clip(self.current_clip.id)
+        finally:
+            database.close()
+        self.captions_panel.set_segments([])
+        self._push_status("Captions cleared")
+
+    def _on_caption_segment_edited(self, segment_id: int, text: str) -> None:
+        if self.project is None:
+            return
+        database = ProjectDatabase(self.project.path)
+        try:
+            CaptionRepository(database).update_text(segment_id, text)
+        finally:
+            database.close()
+        self._push_status("Caption updated")
+
+    def _write_clip_srt(self, clip: Clip | None) -> Path | None:
+        """Snapshot a clip's captions to an SRT file (for burn-in exports)."""
+        if self.project is None or clip is None or clip.id is None:
+            return None
+        segments = self._load_captions(clip.id)
+        if not segments:
+            return None
+        target = self.project.cache_dir / f"captions_clip_{clip.id}.srt"
+        try:
+            return write_srt(segments, target)
+        except OSError as exc:
+            log.warning("could not write srt: %s", exc)
+            return None
 
     # ------------------------------------------------------------ guards
     def _typing_focus(self) -> bool:
@@ -1634,6 +1859,9 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
+            self._transcribe_worker.cancel()
+            self._transcribe_worker.wait(4000)
         self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():

@@ -5,6 +5,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -37,6 +38,8 @@ class ExportDialog(QDialog):
         media: MediaItem,
         parent=None,
         output_dir: str = "",
+        captions_srt: Path | None = None,
+        burn_captions: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle("Export Clip")
@@ -45,6 +48,8 @@ class ExportDialog(QDialog):
         self._clip = clip
         self._media = media
         self._output_dir = output_dir.strip()
+        self._captions_srt = Path(captions_srt) if captions_srt else None
+        self._burn_default = burn_captions and self._captions_srt is not None
         self._worker: ExportWorker | None = None
         self._output: Path | None = None
 
@@ -119,6 +124,15 @@ class ExportDialog(QDialog):
         self.resolution_label = QLabel("")
         self.resolution_label.setStyleSheet("color: #63636e; font-size: 11px;")
         root.addWidget(self.resolution_label)
+
+        self.burn_box = QCheckBox("Burn captions into the video")
+        if self._captions_srt is None:
+            self.burn_box.setEnabled(False)
+            self.burn_box.setToolTip("No captions yet - transcribe on the CAPTIONS page")
+        else:
+            self.burn_box.setToolTip(str(self._captions_srt))
+        self.burn_box.setChecked(self._burn_default)
+        root.addWidget(self.burn_box)
 
         path_row = QHBoxLayout()
         path_caption = QLabel("Output")
@@ -198,6 +212,11 @@ class ExportDialog(QDialog):
             crf=QUALITY_PRESETS[self.preset_box.currentData() or "balanced"]["crf"],
         )
         aspect = self.aspect_box.currentData() or "9:16"
+        subtitles = (
+            self._captions_srt
+            if self.burn_box.isChecked() and self._captions_srt is not None
+            else None
+        )
         return ExportRequest(
             source=Path(self._media.source_path),
             output=Path(self.path_edit.text().strip()),
@@ -205,6 +224,7 @@ class ExportDialog(QDialog):
             end=self._clip.end,
             aspect=aspect,
             settings=settings,
+            subtitles=subtitles,
         )
 
     # ---- flow ----

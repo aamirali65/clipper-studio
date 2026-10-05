@@ -29,6 +29,7 @@ class ExportRequest:
         aspect: str,
         settings: ExportSettings,
         has_audio: bool = True,
+        subtitles: Path | None = None,
     ):
         self.source = Path(source)
         self.output = Path(output)
@@ -37,10 +38,31 @@ class ExportRequest:
         self.aspect = aspect
         self.settings = settings
         self.has_audio = has_audio
+        self.subtitles = Path(subtitles) if subtitles else None
 
     @property
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
+
+
+def subtitles_filter(path: Path | str) -> str:
+    """Build an ffmpeg ``subtitles=`` filter arg with Windows-safe escaping."""
+    value = str(Path(path)).replace("\\", "/")
+    value = value.replace("'", r"\'")
+    value = value.replace(":", r"\:")
+    return f"subtitles=filename='{value}'"
+
+
+def video_filter(request: ExportRequest) -> str:
+    """Scale/crop chain, with burned-in subtitles when the request has them."""
+    width, height = resolution_for(request.aspect)
+    chain = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},setsar=1"
+    )
+    if request.subtitles is not None:
+        chain += "," + subtitles_filter(request.subtitles)
+    return chain
 
 
 class ExportService:
@@ -59,10 +81,7 @@ class ExportService:
             "-i", str(request.source),
             "-t", f"{request.duration:.3f}",
             "-vf",
-            (
-                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},setsar=1"
-            ),
+            video_filter(request),
             "-c:v", "libx264",
             "-preset", preset["preset"],
             "-crf", str(request.settings.crf),

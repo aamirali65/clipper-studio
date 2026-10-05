@@ -35,6 +35,7 @@ class ExportJob(BaseModel):
     preset: str = "balanced"
     crf: int = 21
     pixel_format: str = "yuv420p"
+    subtitles_path: str = ""  # SRT burned into the export when set
     status: str = JOB_QUEUED
     progress: float = 0.0  # 0.0 .. 1.0
     detail: str = ""

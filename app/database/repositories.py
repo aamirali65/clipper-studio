@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 
 from app.database.database import ProjectDatabase
+from app.models.caption import CaptionSegment
 from app.models.clip import Clip, EditorSettings, ExportSettings
 from app.models.media import MediaItem, MediaKind
 from app.models.project import Project, utc_now
@@ -208,6 +209,68 @@ class ClipRepository:
         return clip
 
 
+class CaptionRepository:
+    def __init__(self, db: ProjectDatabase):
+        self.db = db
+
+    def for_clip(self, clip_id: int) -> list[CaptionSegment]:
+        rows = self.db.query(
+            'SELECT * FROM captions WHERE clip_id=? ORDER BY "order" ASC, id ASC',
+            (clip_id,),
+        )
+        return [_row_to_caption(row) for row in rows]
+
+    def replace_for_clip(
+        self, clip_id: int, segments: list[CaptionSegment]
+    ) -> list[CaptionSegment]:
+        """Replace every caption of a clip in one transaction."""
+        language = segments[0].language if segments else ""
+        self.db.execute("DELETE FROM captions WHERE clip_id=?", (clip_id,))
+        saved: list[CaptionSegment] = []
+        for order, segment in enumerate(segments):
+            cursor = self.db.execute(
+                """
+                INSERT INTO captions (clip_id, start_sec, end_sec, text,
+                                      language, "order")
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clip_id,
+                    segment.start,
+                    segment.end,
+                    segment.text,
+                    segment.language or language,
+                    order,
+                ),
+            )
+            segment.id = int(cursor.lastrowid)
+            segment.clip_id = clip_id
+            segment.order = order
+            saved.append(segment)
+        log.info("captions replaced for clip %s (%d segments)", clip_id, len(saved))
+        return saved
+
+    def update_text(self, segment_id: int, text: str) -> None:
+        self.db.execute(
+            "UPDATE captions SET text=? WHERE id=?", (text, segment_id)
+        )
+
+    def delete_for_clip(self, clip_id: int) -> None:
+        self.db.execute("DELETE FROM captions WHERE clip_id=?", (clip_id,))
+
+
+def _row_to_caption(row: sqlite3.Row) -> CaptionSegment:
+    return CaptionSegment(
+        id=row["id"],
+        clip_id=row["clip_id"],
+        start=row["start_sec"],
+        end=row["end_sec"],
+        text=row["text"],
+        language=row["language"],
+        order=row["order"] or 0,
+    )
+
+
 class SettingsRepository:
     def __init__(self, db: ProjectDatabase):
         self.db = db
@@ -353,6 +416,7 @@ def new_project_file(workspace: Path, name: str) -> Path:
 
 
 __all__ = [
+    "CaptionRepository",
     "ClipRepository",
     "MediaRepository",
     "ProjectRepository",

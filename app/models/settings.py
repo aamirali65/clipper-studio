@@ -9,3 +9,6 @@ class AppSettings(BaseModel):
     default_aspect: str = "9:16"
     default_preset: str = "balanced"
     output_dir: str = ""  # "" -> use each project's exports/ folder
+    whisper_model: str = "base"
+    whisper_language: str = "auto"
+    burn_captions: bool = False

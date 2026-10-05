@@ -230,9 +230,10 @@ def test_gui_panels() -> None:
     window = MainWindow()
     window._confirm_discard = lambda: True
 
-    assert window.pages.count() == 6, window.pages.count()
+    assert window.pages.count() == 7, window.pages.count()
     assert window.sidebar._buttons["queue"].isEnabled()
     assert window.sidebar._buttons["settings"].isEnabled()
+    assert window.sidebar._buttons["captions"].isEnabled()
 
     window.sidebar.select("queue")
     assert window.pages.currentIndex() == 4

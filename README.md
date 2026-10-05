@@ -23,6 +23,10 @@ Phase 3 export queue + settings: background export queue with per-job
 progress, cancel/clear controls, and a SETTINGS page for global defaults
 (aspect, quality preset, output folder) persisted in `settings.json`.
 
+Phase 4 captions: local whisper transcription (faster-whisper, no cloud), an
+editable CAPTIONS page with per-clip segments, SRT export, and optional
+burned-in subtitles for single and queued exports.
+
 ## Requirements
 
 - Windows 10/11
@@ -36,7 +40,7 @@ cd D:\Projectss\clipping
 python -m pip install -r requirements.txt
 ```
 
-Dependencies: `PySide6`, `pydantic`, `yt-dlp` (all free/local; no API keys).
+Dependencies: `PySide6`, `pydantic`, `yt-dlp`, `faster-whisper` (all free/local; no API keys).
 
 ## FFmpeg setup
 
@@ -80,6 +84,7 @@ python tests\test_pipeline.py        # timecode, probe, project SQLite, FFmpeg e
 python tests\test_youtube.py         # YouTube URL validation
 python tests\test_gui.py             # full GUI flow: project -> import -> trim -> save -> reopen -> export
 python tests\test_queue_settings.py  # export queue worker + settings persistence
+python tests\test_captions.py        # SRT round-trip, caption DB, burn-in export, captions page
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -109,6 +114,19 @@ ffmpeg -y -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" -f lavfi -i "
    page while you keep editing
 9. Set global defaults (new-project aspect, quality preset, export output
    folder) on the SETTINGS page
+
+### Captions (Phase 4)
+
+1. Select a clip, open the **CAPTIONS** page in the sidebar, pick a whisper
+   model (tiny/base/small/medium) and language on the SETTINGS or CAPTIONS
+   page, and press **Transcribe** - audio is extracted with FFmpeg and
+   transcribed locally in a background thread
+2. The first run downloads the selected model once (tiny ~75 MB, base
+   ~145 MB) into `cache/whisper/`; later runs reuse it
+3. Double-click any segment row to edit the text; edits save immediately
+4. **Export SRT** writes a `.srt` file for the clip
+5. Enable *Burn captions into exports* on SETTINGS (or tick the checkbox in
+   the export dialog) to burn subtitles into single and queued exports
 
 Each clip keeps its own in/out range (source mapping) and timeline position,
 so what you see on the timeline is exactly what gets exported.
@@ -150,20 +168,22 @@ clipper-studio/
 │   │   ├── project_panel.py # project / editor / export pages
 │   │   ├── queue_panel.py   # QUEUE page: background export jobs + progress
 │   │   ├── settings_panel.py# SETTINGS page: global defaults
+│   │   ├── captions_panel.py# CAPTIONS page: transcript segments + transcribe
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
 │   │   ├── status_bar.py    # timecode, aspect, export button
 │   │   └── theme.py         # dark stylesheet
 │   ├── services/            # FFmpegService, VideoService, YouTubeService,
 │   │                        # ExportService, ExportQueueWorker, SettingsService,
-│   │                        # ProjectService
+│   │                        # ProjectService, CaptionService
 │   ├── database/            # database.py (SQLite schema) + repositories.py (all SQL)
 │   ├── models/              # Pydantic: Project, MediaItem, Clip, ExportJob,
-│   │                        # AppSettings, settings
-│   ├── workers/             # QThread: probe, download, metadata, export
+│   │                        # CaptionSegment, AppSettings, settings
+│   ├── workers/             # QThread: probe, download, metadata, export, transcribe
 │   └── utils/               # paths, logging, ffmpeg discovery, timecode
 ├── tests/
 ├── projects/                # workspaces: <name>/media, thumbnails, exports, cache, <name>.clipper
+├── cache/whisper/           # downloaded whisper models (first transcription run)
 ├── settings.json            # global defaults (created after first save)
 ├── logs/clipper.log
 └── output/
@@ -187,8 +207,10 @@ workspace can be moved as long as external media files are relocated too.
   such files first.
 - Frame-exact stepping is not implemented; arrows seek 5s (1s with Shift).
 - Single video track with multi-clip arrangement; audio tracks are not
-  editable. Captions and AI sidebar entries are intentionally disabled - no
-  fake functionality is provided before Phase 4-5.
+  editable. Captions run locally on CPU via faster-whisper: expect a short
+  wait on the first run (model download) and slower-than-realtime
+  transcription on weak hardware. The AI sidebar entry stays disabled until
+  Phase 5 - no fake functionality is provided.
 - The export queue is session-scoped: queued jobs are not persisted across
   app restarts. Settings (aspect/preset/output folder) live in
   `settings.json` next to the app.

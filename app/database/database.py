@@ -53,7 +53,19 @@ CREATE TABLE IF NOT EXISTS export_settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS captions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    clip_id INTEGER NOT NULL,
+    start_sec REAL NOT NULL DEFAULT 0,
+    end_sec REAL NOT NULL DEFAULT 0,
+    text TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    "order" INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_clips_media ON clips(media_id);
+CREATE INDEX IF NOT EXISTS idx_captions_clip ON captions(clip_id);
 """
 
 
