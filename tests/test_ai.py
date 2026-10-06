@@ -235,7 +235,7 @@ def test_gui_ai_page() -> None:
     window._confirm_discard = lambda: True
 
     assert window.sidebar._buttons["ai"].isEnabled(), "ai page disabled"
-    assert window.pages.count() == 8, window.pages.count()
+    assert window.pages.count() == 9, window.pages.count()
     window.sidebar.select("ai")
     assert window.pages.currentIndex() == 7
 

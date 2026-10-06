@@ -114,3 +114,19 @@ def chat_stream(
             response.close()
         except OSError:
             pass
+
+
+def chat_once(
+    url: str,
+    model: str,
+    messages: Sequence[dict],
+    *,
+    options: dict | None = None,
+    timeout: float = 300.0,
+) -> str:
+    """Blocking single-shot chat; collects the whole streamed reply."""
+    return "".join(
+        chat_stream(
+            url, model, messages, options=options, timeout=timeout
+        )
+    )

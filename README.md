@@ -31,6 +31,10 @@ Phase 5 AI assistant: a local Ollama chat with project/clip/transcript
 context, quick actions (summary, titles, hashtags) and streamed responses -
 fully offline, no API keys.
 
+Phase 6 auto-clip detection: the AUTO page finds clip-worthy moments from a
+media's transcript - heuristic scoring always, optional Ollama AI ranking -
+then previews or adds the picked highlights to the timeline as clips.
+
 ## Requirements
 
 - Windows 10/11
@@ -106,6 +110,7 @@ python tests\test_gui.py             # full GUI flow: project -> import -> trim 
 python tests\test_queue_settings.py  # export queue worker + settings persistence
 python tests\test_captions.py        # SRT round-trip, caption DB, burn-in export, captions page
 python tests\test_ai.py              # prompt builders, Ollama service, AI page, live chat (skips if no server)
+python tests\test_autoclip.py        # highlight units/scoring/NMS, transcript cache, AUTO page, real worker run
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -164,6 +169,23 @@ so what you see on the timeline is exactly what gets exported.
 5. Nothing leaves your machine - the app only talks to the Ollama URL in
    settings (default `http://127.0.0.1:11434`)
 
+### Auto clips (Phase 6)
+
+1. Open the **AUTO** page, pick a media file, set min/max clip length and
+   how many highlights to find, and press **Find clips**
+2. The transcript is transcribed locally on the first run (whisper, same
+   models as CAPTIONS) and cached in the project database afterwards -
+   tick *Force re-transcribe* to run it again
+3. Windows are scored by local heuristics (hooks, questions, pacing,
+   coverage); tick **AI rank** to also ask your local Ollama model for
+   highlight moments (results are validated and merged - it degrades to
+   heuristics if Ollama is offline)
+4. Results show a relative score, length and title; double-click or
+   **Preview** to jump the player to that moment, tick/untick rows, then
+   **Add to timeline** to create clips from the checked highlights
+5. Clip naming, timeline positions, undo entries and export behave exactly
+   like clips added by hand
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -193,7 +215,7 @@ clipper-studio/
 │   ├── ui/                  # widgets only (no shell commands, no SQL)
 │   │   ├── main_window.py   # composition, actions, shortcuts, orchestration
 │   │   ├── dashboard.py     # startup screen + recent projects
-│   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / EXPORT nav
+│   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / AUTO / EXPORT nav
 │   │   ├── media_panel.py   # import + YouTube download + media cards
 │   │   ├── video_player.py  # QMediaPlayer preview + aspect framing overlay
 │   │   ├── timeline.py      # multi-clip timeline: split/move/drag, zoom, undo support
@@ -203,6 +225,7 @@ clipper-studio/
 │   │   ├── settings_panel.py# SETTINGS page: global defaults
 │   │   ├── captions_panel.py# CAPTIONS page: transcript segments + transcribe
 │   │   ├── ai_panel.py      # AI page: local Ollama chat + quick actions
+│   │   ├── auto_panel.py    # AUTO page: highlight search + review + add clips
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
 │   │   ├── status_bar.py    # timecode, aspect, export button
@@ -210,12 +233,12 @@ clipper-studio/
 │   ├── services/            # FFmpegService, VideoService, YouTubeService,
 │   │                        # ExportService, ExportQueueWorker, SettingsService,
 │   │                        # ProjectService, CaptionService, OllamaService,
-│   │                        # AiService (prompt builders)
+│   │                        # AiService (prompt builders), HighlightService
 │   ├── database/            # database.py (SQLite schema) + repositories.py (all SQL)
 │   ├── models/              # Pydantic: Project, MediaItem, Clip, ExportJob,
-│   │                        # CaptionSegment, AppSettings, settings
+│   │                        # CaptionSegment, HighlightCandidate, AppSettings, settings
 │   ├── workers/             # QThread: probe, download, metadata, export,
-│   │                        # transcribe, ollama chat + model list
+│   │                        # transcribe, ollama chat + model list, auto-clip
 │   └── utils/               # paths, logging, ffmpeg discovery, timecode
 ├── tests/
 ├── projects/                # workspaces: <name>/media, thumbnails, exports, cache, <name>.clipper
@@ -229,7 +252,7 @@ Each project is a folder containing a SQLite file with a `.clipper` extension:
 
 ```
 projects/MyPodcast/
-├── MyPodcast.clipper   # SQLite: media, clips, settings
+├── MyPodcast.clipper   # SQLite: media, clips, captions, media_transcripts, settings
 ├── media/  thumbnails/  exports/  cache/
 ```
 
@@ -253,6 +276,12 @@ workspace can be moved as long as external media files are relocated too.
 - The export queue is session-scoped: queued jobs are not persisted across
   app restarts. Settings (aspect/preset/output folder) live in
   `settings.json` next to the app.
+- AUTO page highlight results are session-scoped (the transcript cache is
+  persisted per media, the picked candidates are not). The first analysis of
+  a media transcribes the whole file - slow on CPU for long videos. AI
+  ranking is optional and only runs when ticked; without Ollama the page
+  still works with heuristic scoring. Scores are relative within one batch,
+  not absolute quality numbers.
 - Smart crop is center-crop; face/subject tracking is Phase 7.
 - YouTube download uses yt-dlp defaults (no cookies, no API key). Private or
   region-locked videos will fail with the reported yt-dlp error.

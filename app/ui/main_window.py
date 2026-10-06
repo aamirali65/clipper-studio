@@ -23,7 +23,12 @@ from PySide6.QtWidgets import (
 
 from app import APP_NAME
 from app.database.database import ProjectDatabase
-from app.database.repositories import CaptionRepository, ClipRepository, MediaRepository
+from app.database.repositories import (
+    CaptionRepository,
+    ClipRepository,
+    MediaRepository,
+    TranscriptRepository,
+)
 from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, Clip
 from app.models.media import MediaItem, MediaKind, MediaProbeResult
 from app.models.project import Project, utc_now
@@ -36,8 +41,9 @@ from app.services.project_service import ProjectError, ProjectService
 from app.services.settings_service import SettingsService
 from app.services.youtube_service import InvalidYouTubeURL, YouTubeService
 from app.services.video_service import VideoService
-from app.ui.captions_panel import CaptionsPanel
 from app.ui.ai_panel import AIPanel
+from app.ui.auto_panel import AutoPanel
+from app.ui.captions_panel import CaptionsPanel
 from app.ui.dashboard import ProjectDashboard
 from app.ui.export_dialog import ExportDialog
 from app.ui.inspector import Inspector
@@ -63,6 +69,7 @@ from app.workers.download_worker import DownloadWorker, MetadataWorker
 from app.workers.ollama_worker import ModelsWorker, OllamaWorker
 from app.workers.probe_worker import ProbeWorker
 from app.workers.transcribe_worker import TranscribeWorker
+from app.workers.autoclip_worker import AutoClipWorker
 
 log = get_logger("main_window")
 
@@ -74,6 +81,7 @@ PAGE_QUEUE = 4
 PAGE_SETTINGS = 5
 PAGE_CAPTIONS = 6
 PAGE_AI = 7
+PAGE_AUTO = 8
 
 SEEK_STEP_SECONDS = 5.0
 MIN_CLIP_SECONDS = 0.05
@@ -88,6 +96,7 @@ PAGE_INDEX = {
     "settings": PAGE_SETTINGS,
     "captions": PAGE_CAPTIONS,
     "ai": PAGE_AI,
+    "auto": PAGE_AUTO,
 }
 
 
@@ -123,6 +132,8 @@ class MainWindow(QMainWindow):
         self._transcribe_clip_id: int | None = None
         self._ai_worker: OllamaWorker | None = None
         self._models_worker: ModelsWorker | None = None
+        self._auto_worker: AutoClipWorker | None = None
+        self._auto_project_path: str | None = None
 
         self.queue_worker = ExportQueueWorker(self)
         self.queue_worker.jobAdded.connect(self._on_queue_added)
@@ -204,6 +215,7 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel(self.settings_service)
         self.captions_panel = CaptionsPanel()
         self.ai_panel = AIPanel()
+        self.auto_panel = AutoPanel()
         self.player = VideoPlayer()
         self.timeline = Timeline()
         self.inspector = Inspector()
@@ -237,6 +249,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.settings_panel)  # PAGE_SETTINGS
         self.pages.addWidget(self.captions_panel)  # PAGE_CAPTIONS
         self.pages.addWidget(self.ai_panel)        # PAGE_AI
+        self.pages.addWidget(self.auto_panel)      # PAGE_AUTO
         columns.addWidget(self.pages)
 
         center = QVBoxLayout()
@@ -325,6 +338,13 @@ class MainWindow(QMainWindow):
         self.ai_panel.refreshRequested.connect(self._refresh_ai_models)
         self.ai_panel.clearRequested.connect(self._on_ai_clear)
 
+        self.auto_panel.analyzeRequested.connect(self._start_auto_analysis)
+        self.auto_panel.cancelRequested.connect(self._cancel_auto_analysis)
+        self.auto_panel.previewRequested.connect(self._on_auto_preview)
+        self.auto_panel.addRequested.connect(self._on_auto_add)
+        self.auto_panel.clearRequested.connect(self._on_auto_clear)
+        self.auto_panel.mediaChanged.connect(self._on_auto_media_changed)
+
     def _build_shortcuts(self) -> None:
         def add(key: str, slot, name: str) -> None:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -377,6 +397,8 @@ class MainWindow(QMainWindow):
         elif key == "ai":
             self.ai_panel.set_clip(self.current_clip, self._current_media_name())
             self._refresh_ai_models()
+        elif key == "auto":
+            self._refresh_auto_panel()
         elif key == "media":
             if len(self.media_panel.items()) != len(self.project.media):
                 self.media_panel.set_media(self.project.media)
@@ -537,6 +559,7 @@ class MainWindow(QMainWindow):
         self.captions_panel.set_model_value(defaults.whisper_model)
         self.captions_panel.set_language_value(defaults.whisper_language)
         self._refresh_captions_panel()
+        self._refresh_auto_panel()
 
         self._push_status(message or f"Opened {project.name}")
         log.info("project loaded into window: %s", project.name)
@@ -1907,6 +1930,258 @@ class MainWindow(QMainWindow):
         self.ai_panel.clear_chat()
         self._push_status("AI chat cleared")
 
+    # --------------------------------------------------------- auto clips
+    def _load_transcript(self, media_id: int) -> tuple[list, str]:
+        if self.project is None:
+            return [], ""
+        database = ProjectDatabase(self.project.path)
+        try:
+            return TranscriptRepository(database).get(media_id) or ([], "")
+        finally:
+            database.close()
+
+    def _refresh_auto_panel(self) -> None:
+        if self.project is None or self.auto_panel.busy:
+            return
+        project_path = str(self.project.path)
+        if self._auto_project_path != project_path:
+            self._auto_project_path = project_path
+            self.auto_panel.set_candidates([])
+            self.auto_panel.set_status("")
+        preferred = self.current_media.id if self.current_media else None
+        self.auto_panel.set_media(self.project.media, preferred)
+        self._refresh_auto_transcript_status()
+
+    def _refresh_auto_transcript_status(self) -> None:
+        media_id = self.auto_panel.selected_media_id()
+        if self.project is None or media_id is None:
+            self.auto_panel.set_transcript_status("No media selected.")
+            return
+        transcript, language = self._load_transcript(media_id)
+        if transcript:
+            lang = f"  ·  {language}" if language else ""
+            self.auto_panel.set_transcript_status(
+                f"Cached transcript: {len(transcript)} segments{lang}"
+            )
+        else:
+            self.auto_panel.set_transcript_status(
+                "No cached transcript - the first analysis transcribes "
+                "the whole media (cached afterwards)."
+            )
+
+    def _on_auto_media_changed(self, _media_id: int) -> None:
+        if not self.auto_panel.busy:
+            self._refresh_auto_transcript_status()
+
+    def _start_auto_analysis(self) -> None:
+        if not self._require_project():
+            return
+        if self._auto_worker is not None and self._auto_worker.isRunning():
+            self._push_status("Auto-clip analysis is already running")
+            return
+        media_id = self.auto_panel.selected_media_id()
+        media = (
+            self.project.media_by_id(media_id) if media_id is not None else None
+        )
+        if media is None:
+            self.auto_panel.set_status("Select a media file first", error=True)
+            return
+        if media.duration <= 0:
+            self.auto_panel.set_status(
+                "Media duration unknown - reopen the project to probe it",
+                error=True,
+            )
+            return
+        min_len = self.auto_panel.min_len()
+        max_len = self.auto_panel.max_len()
+        if max_len <= min_len:
+            self.auto_panel.set_status(
+                "Max clip length must be greater than min", error=True
+            )
+            return
+        source = media.resolve_path(self.project.directory)
+        if not source.exists():
+            source = Path(media.source_path)
+        if not source.exists():
+            self.auto_panel.set_status(
+                f"Source file not found: {media.source_path}", error=True
+            )
+            return
+
+        cached: list = []
+        language = ""
+        if not self.auto_panel.force_retranscribe():
+            cached, language = self._load_transcript(media.id or 0)
+        if not cached and not whisper_available():
+            self.auto_panel.set_status(
+                "faster-whisper is not installed and there is no cached "
+                "transcript - run: python -m pip install faster-whisper",
+                error=True,
+            )
+            return
+
+        settings = self.settings_service.settings
+        worker = AutoClipWorker(
+            media_id=media.id or 0,
+            media_path=source,
+            media_duration=media.duration,
+            cached_transcript=cached,
+            cached_language=language,
+            min_len=min_len,
+            max_len=max_len,
+            count=self.auto_panel.clip_count(),
+            use_ai=self.auto_panel.use_ai(),
+            ollama_url=settings.ollama_url,
+            ollama_model=settings.ollama_model,
+            whisper_model=settings.whisper_model,
+            whisper_language=settings.whisper_language,
+            download_root=cache_dir() / "whisper",
+            ffmpeg=self.ffmpeg,
+            parent=self,
+        )
+        worker.progress.connect(self._on_auto_progress)
+        worker.completed.connect(self._on_auto_completed)
+        worker.error.connect(self._on_auto_error)
+        self._auto_worker = worker
+        self._track_worker(worker)
+        self.auto_panel.set_busy(True)
+        self.auto_panel.set_status("Starting analysis...")
+        worker.start()
+
+    def _cancel_auto_analysis(self) -> None:
+        if self._auto_worker is not None and self._auto_worker.isRunning():
+            self._auto_worker.cancel()
+            self.auto_panel.set_status("Cancelling...")
+
+    def _on_auto_progress(self, message: str) -> None:
+        self.auto_panel.set_status(message)
+
+    def _on_auto_completed(self, payload: object) -> None:
+        self.auto_panel.set_busy(False)
+        data = payload if isinstance(payload, dict) else {}
+        candidates = list(data.get("candidates") or [])
+        if data.get("transcribed") and self.project is not None:
+            media_id = self.auto_panel.selected_media_id()
+            if media_id is not None:
+                database = ProjectDatabase(self.project.path)
+                try:
+                    TranscriptRepository(database).upsert(
+                        media_id,
+                        list(data.get("transcript") or []),
+                        str(data.get("language") or ""),
+                    )
+                finally:
+                    database.close()
+                self._refresh_auto_transcript_status()
+        self.auto_panel.set_candidates(candidates)
+        note = str(data.get("note") or "")
+        if candidates:
+            status = f"Found {len(candidates)} highlight(s)"
+            if note:
+                status += f" - {note}"
+            self.auto_panel.set_status(status)
+            self._push_status(f"Auto-clip: {len(candidates)} highlight(s) found")
+        else:
+            message = note or "No highlights found - try a wider min/max range"
+            self.auto_panel.set_status(message, error=not note)
+            self._push_status(message)
+
+    def _on_auto_error(self, message: str) -> None:
+        self.auto_panel.set_busy(False)
+        if message == "cancelled":
+            self.auto_panel.set_status("Cancelled")
+            self._push_status("Auto-clip analysis cancelled")
+            return
+        self.auto_panel.set_status(message, error=True)
+        log.warning("auto-clip analysis failed: %s", message)
+        self._push_status("Auto-clip analysis failed")
+
+    def _on_auto_preview(self, index: int) -> None:
+        if self.project is None:
+            return
+        candidates = self.auto_panel.candidates
+        if not (0 <= index < len(candidates)):
+            return
+        media_id = self.auto_panel.selected_media_id()
+        media = (
+            self.project.media_by_id(media_id) if media_id is not None else None
+        )
+        if media is None:
+            return
+        if media != self.current_media:
+            self._activate_media(media)
+        candidate = candidates[index]
+        self._seek_seconds(candidate.start)
+        self._push_status(
+            f"Preview {format_clock(candidate.start)} - "
+            f"{format_clock(candidate.end)}: {candidate.title}"
+        )
+
+    def _on_auto_add(self) -> None:
+        if self.project is None:
+            return
+        candidates = self.auto_panel.checked_candidates()
+        if not candidates:
+            self._push_status("Check at least one highlight first")
+            return
+        media_id = self.auto_panel.selected_media_id()
+        media = (
+            self.project.media_by_id(media_id) if media_id is not None else None
+        )
+        if media is None:
+            media = self.current_media
+        if media is None:
+            self._push_status("Select a media file first")
+            return
+
+        order = max((c.order for c in self.project.clips), default=-1)
+        aspect = self.status_bar.aspect
+        created: list[Clip] = []
+        number = len(self.project.clips) + 1
+        for candidate in candidates:
+            start = max(0.0, candidate.start)
+            end = max(start + MIN_CLIP_SECONDS, candidate.end)
+            if media.duration > 0:
+                start = min(start, max(0.0, media.duration - MIN_CLIP_SECONDS))
+                end = min(end, media.duration)
+                end = max(end, start + MIN_CLIP_SECONDS)
+            order += 1
+            timeline_start = self._next_timeline_position()
+            clip = Clip(
+                media_id=media.id or 0,
+                name=f"Clip {number}",
+                start=start,
+                end=end,
+                aspect=aspect,
+                timeline_start=timeline_start,
+                timeline_end=timeline_start + (end - start),
+                order=order,
+                created_at=utc_now(),
+            )
+            self._persist_clip_new(clip)
+            self.project.clips.append(clip)
+            created.append(clip)
+            number += 1
+            self._push_undo(
+                {
+                    "type": "clip_add",
+                    "clip": clip.model_dump(),
+                    "index": len(self.project.clips) - 1,
+                    "label": "Add highlight",
+                }
+            )
+        if not created:
+            return
+        self._refresh_timeline()
+        self._refresh_clip_list()
+        if created[0].id is not None:
+            self._select_clip(created[0].id)
+        self._push_status(f"Added {len(created)} highlight clip(s)")
+
+    def _on_auto_clear(self) -> None:
+        self.auto_panel.set_candidates([])
+        self.auto_panel.set_status("")
+
     # ------------------------------------------------------------ guards
     def _typing_focus(self) -> bool:
         focused = QApplication.focusWidget()
@@ -2006,6 +2281,9 @@ class MainWindow(QMainWindow):
         if self._ai_worker is not None and self._ai_worker.isRunning():
             self._ai_worker.cancel()
             self._ai_worker.wait(3000)
+        if self._auto_worker is not None and self._auto_worker.isRunning():
+            self._auto_worker.cancel()
+            self._auto_worker.wait(4000)
         self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():

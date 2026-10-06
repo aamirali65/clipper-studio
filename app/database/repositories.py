@@ -271,6 +271,66 @@ def _row_to_caption(row: sqlite3.Row) -> CaptionSegment:
     )
 
 
+class TranscriptRepository:
+    """Full-media transcripts (JSON segments) for the auto-clip analyzer."""
+
+    def __init__(self, db: ProjectDatabase):
+        self.db = db
+
+    def get(self, media_id: int) -> tuple[list[CaptionSegment], str] | None:
+        row = self.db.query_one(
+            "SELECT language, segments FROM media_transcripts WHERE media_id=?",
+            (media_id,),
+        )
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["segments"] or "[]")
+        except ValueError:
+            raw = []
+        segments = [
+            CaptionSegment(
+                clip_id=0,
+                start=float(entry.get("start", 0.0)),
+                end=float(entry.get("end", 0.0)),
+                text=str(entry.get("text", "")),
+                language=row["language"],
+                order=index,
+            )
+            for index, entry in enumerate(raw)
+            if isinstance(entry, dict)
+        ]
+        return segments, row["language"]
+
+    def upsert(
+        self, media_id: int, segments: list[CaptionSegment], language: str = ""
+    ) -> None:
+        payload = json.dumps(
+            [
+                {"start": s.start, "end": s.end, "text": s.text}
+                for s in segments
+            ],
+            ensure_ascii=False,
+        )
+        self.db.execute(
+            """
+            INSERT INTO media_transcripts (media_id, language, segments, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(media_id) DO UPDATE SET
+                language=excluded.language,
+                segments=excluded.segments,
+                updated_at=excluded.updated_at
+            """,
+            (media_id, language, payload, utc_now()),
+        )
+        log.info("transcript stored for media %s (%d segments)", media_id, len(segments))
+
+    def delete_for_media(self, media_id: int) -> None:
+        self.db.execute(
+            "DELETE FROM media_transcripts WHERE media_id=?", (media_id,)
+        )
+
+
 class SettingsRepository:
     def __init__(self, db: ProjectDatabase):
         self.db = db
@@ -421,5 +481,6 @@ __all__ = [
     "MediaRepository",
     "ProjectRepository",
     "SettingsRepository",
+    "TranscriptRepository",
     "new_project_file",
 ]
