@@ -28,6 +28,7 @@ from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, Clip
 from app.models.media import MediaItem, MediaKind, MediaProbeResult
 from app.models.project import Project, utc_now
 from app.models.queue import JOB_RUNNING, ExportJob
+from app.services.ai_service import action_prompt, build_messages, project_context
 from app.services.caption_service import whisper_available, write_srt
 from app.services.export_queue import ExportQueueWorker
 from app.services.ffmpeg_service import FFmpegService
@@ -36,6 +37,7 @@ from app.services.settings_service import SettingsService
 from app.services.youtube_service import InvalidYouTubeURL, YouTubeService
 from app.services.video_service import VideoService
 from app.ui.captions_panel import CaptionsPanel
+from app.ui.ai_panel import AIPanel
 from app.ui.dashboard import ProjectDashboard
 from app.ui.export_dialog import ExportDialog
 from app.ui.inspector import Inspector
@@ -58,6 +60,7 @@ from app.utils.paths import (
 )
 from app.utils.timecode import format_clock, format_timecode
 from app.workers.download_worker import DownloadWorker, MetadataWorker
+from app.workers.ollama_worker import ModelsWorker, OllamaWorker
 from app.workers.probe_worker import ProbeWorker
 from app.workers.transcribe_worker import TranscribeWorker
 
@@ -70,6 +73,7 @@ PAGE_EXPORT = 3
 PAGE_QUEUE = 4
 PAGE_SETTINGS = 5
 PAGE_CAPTIONS = 6
+PAGE_AI = 7
 
 SEEK_STEP_SECONDS = 5.0
 MIN_CLIP_SECONDS = 0.05
@@ -83,6 +87,7 @@ PAGE_INDEX = {
     "queue": PAGE_QUEUE,
     "settings": PAGE_SETTINGS,
     "captions": PAGE_CAPTIONS,
+    "ai": PAGE_AI,
 }
 
 
@@ -116,6 +121,8 @@ class MainWindow(QMainWindow):
         self._committed_range: tuple[float, float] | None = None
         self._transcribe_worker: TranscribeWorker | None = None
         self._transcribe_clip_id: int | None = None
+        self._ai_worker: OllamaWorker | None = None
+        self._models_worker: ModelsWorker | None = None
 
         self.queue_worker = ExportQueueWorker(self)
         self.queue_worker.jobAdded.connect(self._on_queue_added)
@@ -196,6 +203,7 @@ class MainWindow(QMainWindow):
         self.queue_panel = QueuePanel()
         self.settings_panel = SettingsPanel(self.settings_service)
         self.captions_panel = CaptionsPanel()
+        self.ai_panel = AIPanel()
         self.player = VideoPlayer()
         self.timeline = Timeline()
         self.inspector = Inspector()
@@ -228,6 +236,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.queue_panel)     # PAGE_QUEUE
         self.pages.addWidget(self.settings_panel)  # PAGE_SETTINGS
         self.pages.addWidget(self.captions_panel)  # PAGE_CAPTIONS
+        self.pages.addWidget(self.ai_panel)        # PAGE_AI
         columns.addWidget(self.pages)
 
         center = QVBoxLayout()
@@ -310,6 +319,12 @@ class MainWindow(QMainWindow):
         self.captions_panel.clearRequested.connect(self._on_caption_clear)
         self.captions_panel.segmentEdited.connect(self._on_caption_segment_edited)
 
+        self.ai_panel.sendRequested.connect(self._on_ai_send)
+        self.ai_panel.actionRequested.connect(self._on_ai_action)
+        self.ai_panel.cancelRequested.connect(self._on_ai_cancel)
+        self.ai_panel.refreshRequested.connect(self._refresh_ai_models)
+        self.ai_panel.clearRequested.connect(self._on_ai_clear)
+
     def _build_shortcuts(self) -> None:
         def add(key: str, slot, name: str) -> None:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -359,6 +374,9 @@ class MainWindow(QMainWindow):
             self.settings_panel.load_values()
         elif key == "captions":
             self._refresh_captions_panel()
+        elif key == "ai":
+            self.ai_panel.set_clip(self.current_clip, self._current_media_name())
+            self._refresh_ai_models()
         elif key == "media":
             if len(self.media_panel.items()) != len(self.project.media):
                 self.media_panel.set_media(self.project.media)
@@ -1024,6 +1042,8 @@ class MainWindow(QMainWindow):
             self._committed_range = (clip.start, clip.end)
         if self.pages.currentIndex() == PAGE_CAPTIONS:
             self._refresh_captions_panel()
+        elif self.pages.currentIndex() == PAGE_AI:
+            self.ai_panel.set_clip(clip, self._current_media_name())
         self._push_status(f"Selected {clip.name}")
 
     def _on_clip_selected(self, clip_id: int) -> None:
@@ -1578,6 +1598,7 @@ class MainWindow(QMainWindow):
     def _on_settings_saved(self, settings) -> None:
         self.captions_panel.set_model_value(settings.whisper_model)
         self.captions_panel.set_language_value(settings.whisper_language)
+        self.ai_panel.set_status("Settings saved - press Refresh on the AI page")
         self._push_status(
             f"Settings saved  -  {settings.default_aspect}  ·  "
             f"{settings.default_preset}"
@@ -1766,6 +1787,126 @@ class MainWindow(QMainWindow):
             log.warning("could not write srt: %s", exc)
             return None
 
+    # ----------------------------------------------------------------- ai
+    def _current_media_name(self) -> str:
+        if self.project is None or self.current_clip is None:
+            return ""
+        media = self.project.media_by_id(self.current_clip.media_id)
+        return media.name if media else ""
+
+    def _refresh_ai_models(self) -> None:
+        if self._models_worker is not None and self._models_worker.isRunning():
+            return
+        url = self.settings_service.settings.ollama_url
+        worker = ModelsWorker(url, parent=self)
+        worker.completed.connect(self._on_ai_models_loaded)
+        worker.error.connect(self._on_ai_models_error)
+        self._models_worker = worker
+        self._track_worker(worker)
+        self.ai_panel.set_status("Checking Ollama server...")
+        worker.start()
+
+    def _on_ai_models_loaded(self, models: list) -> None:
+        preferred = self.settings_service.settings.ollama_model
+        self.ai_panel.set_models(list(models), preferred)
+        if models:
+            self.ai_panel.set_status(f"{len(models)} model(s) ready")
+        else:
+            self.ai_panel.set_status(
+                "Ollama is running but has no models - run: "
+                "ollama pull qwen2.5:3b",
+                error=True,
+            )
+
+    def _on_ai_models_error(self, message: str) -> None:
+        self.ai_panel.set_models([])
+        self.ai_panel.set_status(message, error=True)
+
+    def _ai_context(self) -> str:
+        clip = self.current_clip
+        captions = (
+            self._load_captions(clip.id)
+            if clip is not None and clip.id is not None
+            else []
+        )
+        return project_context(
+            self.project, clip, self._current_media_name(), captions
+        )
+
+    def _on_ai_send(self, text: str, display: str | None = None) -> None:
+        if not self._require_project():
+            return
+        if self.ai_panel.busy:
+            self._push_status("The assistant is already responding")
+            return
+        model = self.ai_panel.selected_model()
+        if not model:
+            self.ai_panel.set_status(
+                "No model selected - is the Ollama server running? "
+                "Check the URL on SETTINGS, then press Refresh.",
+                error=True,
+            )
+            return
+        settings = self.settings_service.settings
+        if model != settings.ollama_model:
+            settings.ollama_model = model
+            self.settings_service.save(settings)
+        messages = build_messages(
+            self._ai_context(), self.ai_panel.history, text
+        )
+        worker = OllamaWorker(
+            settings.ollama_url, model, messages, parent=self
+        )
+        worker.token.connect(self.ai_panel.append_token)
+        worker.completed.connect(self._on_ai_completed)
+        worker.error.connect(self._on_ai_error)
+        self._ai_worker = worker
+        self._track_worker(worker)
+        self.ai_panel.append_user(display or text)
+        self.ai_panel.begin_assistant()
+        self.ai_panel.set_busy(True)
+        self.ai_panel.set_status(f"Thinking with {model}...")
+        worker.start()
+
+    def _on_ai_action(self, action: str) -> None:
+        if not self._require_project():
+            return
+        if self.current_clip is None:
+            self.ai_panel.set_status(
+                "Select a clip first - quick actions use its transcript",
+                error=True,
+            )
+            return
+        prompt = action_prompt(action, self._ai_context())
+        if prompt is None:
+            return
+        label, message = prompt
+        self._on_ai_send(message, display=label)
+
+    def _on_ai_completed(self) -> None:
+        self.ai_panel.finish_assistant()
+        self.ai_panel.set_busy(False)
+        self.ai_panel.set_status("Done")
+
+    def _on_ai_error(self, message: str) -> None:
+        self.ai_panel.finish_assistant()
+        self.ai_panel.set_busy(False)
+        if message == "cancelled":
+            self.ai_panel.set_status("Cancelled")
+            self._push_status("AI response cancelled")
+        else:
+            self.ai_panel.set_status(message, error=True)
+            self._push_status("AI request failed")
+
+    def _on_ai_cancel(self) -> None:
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            self._ai_worker.cancel()
+            self.ai_panel.set_status("Cancelling...")
+
+    def _on_ai_clear(self) -> None:
+        self.ai_panel.clear_chat()
+        self._push_status("AI chat cleared")
+
     # ------------------------------------------------------------ guards
     def _typing_focus(self) -> bool:
         focused = QApplication.focusWidget()
@@ -1862,6 +2003,9 @@ class MainWindow(QMainWindow):
         if self._transcribe_worker is not None and self._transcribe_worker.isRunning():
             self._transcribe_worker.cancel()
             self._transcribe_worker.wait(4000)
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            self._ai_worker.cancel()
+            self._ai_worker.wait(3000)
         self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():

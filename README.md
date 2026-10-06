@@ -27,11 +27,16 @@ Phase 4 captions: local whisper transcription (faster-whisper, no cloud), an
 editable CAPTIONS page with per-clip segments, SRT export, and optional
 burned-in subtitles for single and queued exports.
 
+Phase 5 AI assistant: a local Ollama chat with project/clip/transcript
+context, quick actions (summary, titles, hashtags) and streamed responses -
+fully offline, no API keys.
+
 ## Requirements
 
 - Windows 10/11
 - Python 3.11+ (tested on 3.14)
 - FFmpeg on PATH (`ffmpeg.exe`, `ffprobe.exe`)
+- Optional: [Ollama](https://ollama.com) for the AI assistant page
 
 ## Installation
 
@@ -65,6 +70,21 @@ ffprobe -version
 If FFmpeg is missing, Clipper Studio still starts and shows a warning in the
 status bar; export and metadata probing will not work until it is installed.
 
+## Ollama setup (optional - AI assistant)
+
+The AI page talks to a local [Ollama](https://ollama.com) server:
+
+```powershell
+winget install Ollama.Ollama
+ollama serve            # usually already running as a tray service
+ollama pull qwen2.5:3b  # any chat model works
+```
+
+The server URL defaults to `http://127.0.0.1:11434` (changeable on the
+SETTINGS page). The AI page lists installed models; without Ollama the page
+still opens and reports that the server is unreachable - everything else in
+the app keeps working.
+
 ## Run
 
 ```powershell
@@ -85,6 +105,7 @@ python tests\test_youtube.py         # YouTube URL validation
 python tests\test_gui.py             # full GUI flow: project -> import -> trim -> save -> reopen -> export
 python tests\test_queue_settings.py  # export queue worker + settings persistence
 python tests\test_captions.py        # SRT round-trip, caption DB, burn-in export, captions page
+python tests\test_ai.py              # prompt builders, Ollama service, AI page, live chat (skips if no server)
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -131,6 +152,18 @@ ffmpeg -y -f lavfi -i "testsrc2=duration=30:size=1280x720:rate=30" -f lavfi -i "
 Each clip keeps its own in/out range (source mapping) and timeline position,
 so what you see on the timeline is exactly what gets exported.
 
+### AI assistant (Phase 5)
+
+1. Open the **AI** page - it lists the models your local Ollama server has
+   installed (press **Refresh** after changing the URL on SETTINGS)
+2. Ask anything in the input box; answers stream in live and the assistant
+   sees the project's clip list plus the selected clip's transcript
+3. With a clip selected, use the **Summary / Titles / Hashtags** quick
+   actions for one-click prompts grounded in that clip's captions
+4. **Clear chat** resets the conversation (history is session-only)
+5. Nothing leaves your machine - the app only talks to the Ollama URL in
+   settings (default `http://127.0.0.1:11434`)
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -169,17 +202,20 @@ clipper-studio/
 │   │   ├── queue_panel.py   # QUEUE page: background export jobs + progress
 │   │   ├── settings_panel.py# SETTINGS page: global defaults
 │   │   ├── captions_panel.py# CAPTIONS page: transcript segments + transcribe
+│   │   ├── ai_panel.py      # AI page: local Ollama chat + quick actions
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
 │   │   ├── status_bar.py    # timecode, aspect, export button
 │   │   └── theme.py         # dark stylesheet
 │   ├── services/            # FFmpegService, VideoService, YouTubeService,
 │   │                        # ExportService, ExportQueueWorker, SettingsService,
-│   │                        # ProjectService, CaptionService
+│   │                        # ProjectService, CaptionService, OllamaService,
+│   │                        # AiService (prompt builders)
 │   ├── database/            # database.py (SQLite schema) + repositories.py (all SQL)
 │   ├── models/              # Pydantic: Project, MediaItem, Clip, ExportJob,
 │   │                        # CaptionSegment, AppSettings, settings
-│   ├── workers/             # QThread: probe, download, metadata, export, transcribe
+│   ├── workers/             # QThread: probe, download, metadata, export,
+│   │                        # transcribe, ollama chat + model list
 │   └── utils/               # paths, logging, ffmpeg discovery, timecode
 ├── tests/
 ├── projects/                # workspaces: <name>/media, thumbnails, exports, cache, <name>.clipper
@@ -209,8 +245,11 @@ workspace can be moved as long as external media files are relocated too.
 - Single video track with multi-clip arrangement; audio tracks are not
   editable. Captions run locally on CPU via faster-whisper: expect a short
   wait on the first run (model download) and slower-than-realtime
-  transcription on weak hardware. The AI sidebar entry stays disabled until
-  Phase 5 - no fake functionality is provided.
+  transcription on weak hardware.
+- The AI assistant needs a separately installed Ollama server with at least
+  one pulled model; responses depend on your hardware and model size. Chat
+  history is session-scoped (not saved to the project), and the transcript
+  context sent to the model is capped at ~6000 characters.
 - The export queue is session-scoped: queued jobs are not persisted across
   app restarts. Settings (aspect/preset/output folder) live in
   `settings.json` next to the app.

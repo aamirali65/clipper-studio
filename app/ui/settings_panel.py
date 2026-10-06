@@ -141,6 +141,35 @@ class SettingsPanel(QWidget):
 
         root.addWidget(cap_card)
 
+        # ---- AI card ----
+        ai_card = QFrame()
+        ai_card.setStyleSheet(
+            "QFrame { background-color: #16161b; border: 1px solid #2a2a32;"
+            " border-radius: 8px; }"
+        )
+        ai_layout = QVBoxLayout(ai_card)
+        ai_layout.setContentsMargins(12, 12, 12, 12)
+        ai_layout.setSpacing(8)
+
+        ai_layout.addWidget(caption("Ollama server URL (AI assistant)"))
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("http://127.0.0.1:11434")
+        self.url_edit.setToolTip(
+            "Local Ollama server. Install from ollama.com and run "
+            "'ollama serve'; pick the model on the AI page."
+        )
+        ai_layout.addWidget(self.url_edit)
+
+        ai_hint = QLabel(
+            "Models are listed on the AI page once the server responds. "
+            "Nothing is sent to the cloud."
+        )
+        ai_hint.setWordWrap(True)
+        ai_hint.setStyleSheet("color: #4d4d55; font-size: 10px;")
+        ai_layout.addWidget(ai_hint)
+
+        root.addWidget(ai_card)
+
         # ---- save row ----
         actions = QHBoxLayout()
         actions.setSpacing(8)
@@ -177,6 +206,7 @@ class SettingsPanel(QWidget):
         language_index = self.language_box.findData(settings.whisper_language)
         self.language_box.setCurrentIndex(language_index if language_index >= 0 else 0)
         self.burn_box.setChecked(bool(settings.burn_captions))
+        self.url_edit.setText(settings.ollama_url)
 
     def _save(self) -> None:
         settings = AppSettings(
@@ -186,6 +216,8 @@ class SettingsPanel(QWidget):
             whisper_model=self.model_box.currentData() or "base",
             whisper_language=self.language_box.currentData() or "auto",
             burn_captions=self.burn_box.isChecked(),
+            ollama_url=self.url_edit.text().strip() or "http://127.0.0.1:11434",
+            ollama_model=self._service.settings.ollama_model,
         )
         if settings.output_dir:
             target = Path(settings.output_dir)

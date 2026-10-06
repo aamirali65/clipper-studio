@@ -12,3 +12,5 @@ class AppSettings(BaseModel):
     whisper_model: str = "base"
     whisper_language: str = "auto"
     burn_captions: bool = False
+    ollama_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = ""  # "" -> first model reported by the server

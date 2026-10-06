@@ -39,7 +39,7 @@ class CaptionsPanel(QWidget):
         root.setContentsMargins(14, 14, 10, 12)
         root.setSpacing(10)
 
-        header_row = __import__("PySide6.QtWidgets", fromlist=["QHBoxLayout"]).QHBoxLayout()
+        header_row = QHBoxLayout()
         header = QLabel("CAPTIONS")
         header.setStyleSheet(
             "color: #9a9aa4; font-size: 11px; font-weight: 700; letter-spacing: 2px;"
@@ -56,7 +56,7 @@ class CaptionsPanel(QWidget):
         )
         root.addWidget(self.clip_label)
 
-        options = __import__("PySide6.QtWidgets", fromlist=["QHBoxLayout"]).QHBoxLayout()
+        options = QHBoxLayout()
         options.setSpacing(8)
         self.model_box = QComboBox()
         for key, label in WHISPER_MODELS.items():
@@ -68,7 +68,7 @@ class CaptionsPanel(QWidget):
         options.addWidget(self.language_box, 1)
         root.addLayout(options)
 
-        actions = __import__("PySide6.QtWidgets", fromlist=["QHBoxLayout"]).QHBoxLayout()
+        actions = QHBoxLayout()
         actions.setSpacing(8)
         self.transcribe_button = QPushButton("Transcribe clip")
         self.transcribe_button.setObjectName("PrimaryButton")
@@ -105,9 +105,9 @@ class CaptionsPanel(QWidget):
         self.tree.itemChanged.connect(self._on_item_changed)
         root.addWidget(self.tree, 1)
 
-        buttons = __import__("PySide6.QtWidgets", fromlist=["QHBoxLayout"]).QHBoxLayout()
+        buttons = QHBoxLayout()
         buttons.setSpacing(8)
-        self.export_button = QPushButton("Export SRTâ€¦")
+        self.export_button = QPushButton("Export SRT…")
         self.export_button.clicked.connect(self.exportSrtRequested)
         self.clear_button = QPushButton("Clear captions")
         self.clear_button.clicked.connect(self.clearRequested)
@@ -133,11 +133,11 @@ class CaptionsPanel(QWidget):
         if clip is None:
             self.clip_label.setText("No clip selected.")
         else:
-            where = f"  Â·  {media_name}" if media_name else ""
+            where = f"  ·  {media_name}" if media_name else ""
             self.clip_label.setText(
                 f"<b style='color:#e4e4e8'>{clip.name}</b>{where}<br>"
-                f"{format_timecode(clip.start)} â†’ {format_timecode(clip.end)}"
-                f"  Â·  {clip.duration:.2f}s  Â·  {clip.aspect}"
+                f"{format_timecode(clip.start)} → {format_timecode(clip.end)}"
+                f"  ·  {clip.duration:.2f}s  ·  {clip.aspect}"
             )
         self._update_buttons()
 
