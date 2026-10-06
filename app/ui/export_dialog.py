@@ -40,6 +40,8 @@ class ExportDialog(QDialog):
         output_dir: str = "",
         captions_srt: Path | None = None,
         burn_captions: bool = False,
+        smart_track: list | None = None,
+        smart_crop_default: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle("Export Clip")
@@ -50,6 +52,7 @@ class ExportDialog(QDialog):
         self._output_dir = output_dir.strip()
         self._captions_srt = Path(captions_srt) if captions_srt else None
         self._burn_default = burn_captions and self._captions_srt is not None
+        self._smart_track = list(smart_track) if smart_track else None
         self._worker: ExportWorker | None = None
         self._output: Path | None = None
 
@@ -134,6 +137,21 @@ class ExportDialog(QDialog):
         self.burn_box.setChecked(self._burn_default)
         root.addWidget(self.burn_box)
 
+        self.smart_box = QCheckBox("Smart crop (follow tracked subject)")
+        if self._smart_track:
+            self.smart_box.setEnabled(True)
+            self.smart_box.setChecked(bool(smart_crop_default))
+            self.smart_box.setToolTip(
+                "Uses the face track analyzed on the SMART page"
+            )
+        else:
+            self.smart_box.setEnabled(False)
+            self.smart_box.setToolTip(
+                "No face track for this media - run Track faces on the "
+                "SMART page first"
+            )
+        root.addWidget(self.smart_box)
+
         path_row = QHBoxLayout()
         path_caption = QLabel("Output")
         path_caption.setStyleSheet("color: #83838d;")
@@ -217,6 +235,14 @@ class ExportDialog(QDialog):
             if self.burn_box.isChecked() and self._captions_srt is not None
             else None
         )
+        smart = (
+            self._smart_track
+            if self.smart_box.isChecked() and self._smart_track
+            else None
+        )
+        source_size = None
+        if smart and self._media.width and self._media.height:
+            source_size = (self._media.width, self._media.height)
         return ExportRequest(
             source=Path(self._media.source_path),
             output=Path(self.path_edit.text().strip()),
@@ -225,6 +251,8 @@ class ExportDialog(QDialog):
             aspect=aspect,
             settings=settings,
             subtitles=subtitles,
+            smart_track=smart,
+            source_size=source_size,
         )
 
     # ---- flow ----

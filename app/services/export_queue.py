@@ -58,6 +58,7 @@ class ExportQueueWorker(QThread):
         settings: ExportSettings | None = None,
         captions_srt: Path | str = "",
         autostart: bool = True,
+        smart_crop: bool = False,
     ) -> ExportJob:
         media = project.media_by_id(clip.media_id)
         settings = settings or project.export_settings
@@ -87,6 +88,7 @@ class ExportQueueWorker(QThread):
                 id=self._next_id,
                 clip_name=clip.name,
                 media_name=media.name if media else "",
+                media_id=media.id or 0 if media else 0,
                 aspect=clip.aspect,
                 source=source,
                 output=str(output),
@@ -96,6 +98,7 @@ class ExportQueueWorker(QThread):
                 crf=settings.crf,
                 pixel_format=settings.pixel_format,
                 subtitles_path=str(captions_srt) if captions_srt else "",
+                smart_crop=smart_crop,
                 project_name=project.name,
                 project_path=str(project.path),
             )
@@ -222,6 +225,7 @@ class ExportQueueWorker(QThread):
                 self._cancel_event = None
 
     def _run_job(self, job: ExportJob, cancel_event: threading.Event) -> None:
+        smart_track = self._job_track(job)
         request = ExportRequest(
             source=Path(job.source),
             output=Path(job.output),
@@ -232,6 +236,7 @@ class ExportQueueWorker(QThread):
                 preset=job.preset, crf=job.crf, pixel_format=job.pixel_format
             ),
             subtitles=Path(job.subtitles_path) if job.subtitles_path else None,
+            smart_track=smart_track,
         )
         last_emit = -1.0
 
@@ -285,6 +290,26 @@ class ExportQueueWorker(QThread):
         self.jobUpdated.emit(snapshot)
 
     # ----------------------------------------------------------- helpers
+    def _job_track(self, job: ExportJob) -> list | None:
+        """Load the media's face track for a smart-crop job (None-safe)."""
+        if not job.smart_crop or job.media_id <= 0 or not job.project_path:
+            return None
+        try:
+            from app.database.database import ProjectDatabase
+            from app.database.repositories import TrackRepository
+
+            database = ProjectDatabase(job.project_path)
+            try:
+                info = TrackRepository(database).get(job.media_id)
+            finally:
+                database.close()
+        except Exception as exc:  # noqa: BLE001 - degrade to center crop
+            log.warning("smart crop track load failed: %s", exc)
+            return None
+        if info is None or not info.keyframes:
+            return None
+        return info.keyframes
+
     def _has_queued_unlocked(self) -> bool:
         return any(job.status == JOB_QUEUED for job in self._jobs)
 

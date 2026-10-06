@@ -139,6 +139,16 @@ class SettingsPanel(QWidget):
         self.burn_box.setStyleSheet("color: #83838d;")
         cap_layout.addWidget(self.burn_box)
 
+        self.smart_box = QCheckBox(
+            "Smart crop exports when a face track exists (SMART page)"
+        )
+        self.smart_box.setStyleSheet("color: #83838d;")
+        self.smart_box.setToolTip(
+            "Queue exports follow the tracked subject instead of always "
+            "center-cropping. Track faces on the SMART page first."
+        )
+        cap_layout.addWidget(self.smart_box)
+
         root.addWidget(cap_card)
 
         # ---- AI card ----
@@ -206,6 +216,7 @@ class SettingsPanel(QWidget):
         language_index = self.language_box.findData(settings.whisper_language)
         self.language_box.setCurrentIndex(language_index if language_index >= 0 else 0)
         self.burn_box.setChecked(bool(settings.burn_captions))
+        self.smart_box.setChecked(bool(settings.smart_crop))
         self.url_edit.setText(settings.ollama_url)
 
     def _save(self) -> None:
@@ -216,6 +227,7 @@ class SettingsPanel(QWidget):
             whisper_model=self.model_box.currentData() or "base",
             whisper_language=self.language_box.currentData() or "auto",
             burn_captions=self.burn_box.isChecked(),
+            smart_crop=self.smart_box.isChecked(),
             ollama_url=self.url_edit.text().strip() or "http://127.0.0.1:11434",
             ollama_model=self._service.settings.ollama_model,
         )

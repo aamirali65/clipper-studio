@@ -9,6 +9,7 @@ from app.models.caption import CaptionSegment
 from app.models.clip import Clip, EditorSettings, ExportSettings
 from app.models.media import MediaItem, MediaKind
 from app.models.project import Project, utc_now
+from app.models.track import TrackInfo, TrackKeyframe
 from app.utils.paths import PROJECT_EXTENSION, safe_name, to_portable
 from app.utils.logging import get_logger
 
@@ -328,6 +329,92 @@ class TranscriptRepository:
     def delete_for_media(self, media_id: int) -> None:
         self.db.execute(
             "DELETE FROM media_transcripts WHERE media_id=?", (media_id,)
+        )
+
+
+class TrackRepository:
+    """Smart-crop face tracks (JSON keyframes) per media file."""
+
+    def __init__(self, db: ProjectDatabase):
+        self.db = db
+
+    def get(self, media_id: int) -> TrackInfo | None:
+        row = self.db.query_one(
+            "SELECT * FROM media_tracks WHERE media_id=?", (media_id,)
+        )
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["keyframes"] or "[]")
+        except ValueError:
+            raw = []
+        keyframes = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                keyframes.append(TrackKeyframe(**entry))
+            except ValueError:
+                continue
+        return TrackInfo(
+            media_id=media_id,
+            keyframes=keyframes,
+            detector=row["detector"],
+            frames=row["frames"] or 0,
+            hits=row["hits"] or 0,
+            width=row["width"] or 0,
+            height=row["height"] or 0,
+            updated_at=row["updated_at"],
+        )
+
+    def upsert(
+        self,
+        media_id: int,
+        keyframes: list[TrackKeyframe],
+        *,
+        detector: str = "",
+        frames: int = 0,
+        hits: int = 0,
+        width: int = 0,
+        height: int = 0,
+    ) -> None:
+        payload = json.dumps(
+            [kf.model_dump() for kf in keyframes], ensure_ascii=False
+        )
+        self.db.execute(
+            """
+            INSERT INTO media_tracks
+                (media_id, keyframes, detector, frames, hits, width, height, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(media_id) DO UPDATE SET
+                keyframes=excluded.keyframes,
+                detector=excluded.detector,
+                frames=excluded.frames,
+                hits=excluded.hits,
+                width=excluded.width,
+                height=excluded.height,
+                updated_at=excluded.updated_at
+            """,
+            (
+                media_id,
+                payload,
+                detector,
+                frames,
+                hits,
+                width,
+                height,
+                utc_now(),
+            ),
+        )
+        log.info(
+            "face track stored for media %s (%d keyframes)",
+            media_id,
+            len(keyframes),
+        )
+
+    def delete_for_media(self, media_id: int) -> None:
+        self.db.execute(
+            "DELETE FROM media_tracks WHERE media_id=?", (media_id,)
         )
 
 

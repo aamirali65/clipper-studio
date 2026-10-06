@@ -27,6 +27,7 @@ class ExportJob(BaseModel):
     id: int
     clip_name: str
     media_name: str = ""
+    media_id: int = 0  # used to load the smart-crop face track
     aspect: str = "9:16"
     source: str = ""
     output: str = ""
@@ -36,6 +37,7 @@ class ExportJob(BaseModel):
     crf: int = 21
     pixel_format: str = "yuv420p"
     subtitles_path: str = ""  # SRT burned into the export when set
+    smart_crop: bool = False  # follow the media's face track when present
     status: str = JOB_QUEUED
     progress: float = 0.0  # 0.0 .. 1.0
     detail: str = ""

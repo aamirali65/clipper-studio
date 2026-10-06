@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services.face_track_service import box_at, crop_xy, plane_size
 from app.utils.timecode import format_timecode
 
 ASPECT_RATIOS: dict[str, tuple[int, int]] = {
@@ -79,6 +80,100 @@ class AspectOverlay(QWidget):
         painter.end()
 
 
+class TrackOverlay(QWidget):
+    """Paints the smart-crop focus box + export crop window over the preview."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._keyframes: list = []
+        self._src_size: tuple[int, int] = (0, 0)
+        self._aspect = "9:16"
+        self._t = -1.0
+
+    @property
+    def active(self) -> bool:
+        return bool(self._keyframes) and self._src_size[0] > 0
+
+    def set_track(self, keyframes: list, source_size: tuple[int, int], aspect: str) -> None:
+        self._keyframes = list(keyframes or [])
+        self._src_size = source_size
+        self._aspect = aspect
+        self.update()
+
+    def clear_track(self) -> None:
+        self._keyframes = []
+        self._t = -1.0
+        self.update()
+
+    def set_aspect(self, aspect: str) -> None:
+        if aspect in ASPECT_RATIOS:
+            self._aspect = aspect
+            self.update()
+
+    def set_position(self, seconds: float) -> None:
+        if abs(seconds - self._t) < 0.04:
+            return
+        self._t = seconds
+        self.update()
+
+    def _video_rect(self):
+        from PySide6.QtCore import QRectF
+
+        if self._src_size[0] <= 0 or self._src_size[1] <= 0:
+            return QRectF(0, 0, self.width(), self.height())
+        scale = min(
+            self.width() / self._src_size[0], self.height() / self._src_size[1]
+        )
+        w = self._src_size[0] * scale
+        h = self._src_size[1] * scale
+        return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
+
+    def paintEvent(self, event) -> None:
+        if not self.active or self._t < 0:
+            return
+        box = box_at(self._keyframes, self._t)
+        if box is None:
+            return
+        video = self._video_rect()
+        if video.width() <= 0 or video.height() <= 0:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # tracked focus box (normalized -> source px -> widget px)
+        fx = video.x() + box[0] * video.width()
+        fy = video.y() + box[1] * video.height()
+        fw = box[2] * video.width()
+        fh = box[3] * video.height()
+        painter.fillRect(fx, fy, fw, fh, QColor(90, 220, 140, 40))
+        painter.setPen(QPen(QColor(120, 230, 150, 220), 2))
+        painter.drawRect(fx, fy, fw, fh)
+
+        # export crop window for the current aspect at this time
+        ratio_w, ratio_h = ASPECT_RATIOS.get(self._aspect, (9, 16))
+        out_w, out_h = ratio_w * 100, ratio_h * 100
+        plane_w, plane_h = plane_size(
+            self._src_size[0], self._src_size[1], out_w, out_h
+        )
+        crop_x, crop_y = crop_xy(box, out_w, out_h, plane_w, plane_h)
+        factor = plane_w / max(1, self._src_size[0])
+        sx = crop_x / factor / self._src_size[0]
+        sy = crop_y / factor / self._src_size[1]
+        sw = out_w / factor / self._src_size[0]
+        sh = out_h / factor / self._src_size[1]
+        cx = video.x() + sx * video.width()
+        cy = video.y() + sy * video.height()
+        cw = sw * video.width()
+        ch = sh * video.height()
+        painter.setPen(QPen(QColor(255, 170, 60, 235), 2, Qt.PenStyle.DashLine))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(cx, cy, cw, ch)
+        painter.end()
+
+
 class VideoPlayer(QWidget):
     """Real video preview backed by Qt Multimedia (QMediaPlayer)."""
 
@@ -125,6 +220,7 @@ class VideoPlayer(QWidget):
 
         self.overlay = AspectOverlay(self.video_widget)
         self.overlay.set_active(False)
+        self.track_overlay = TrackOverlay(self.video_widget)
         self._overlay_geom = None
 
         root.addWidget(self.video_widget, 1)
@@ -181,7 +277,16 @@ class VideoPlayer(QWidget):
     def set_aspect(self, aspect: str, active: bool = True) -> None:
         self.overlay.set_aspect(aspect)
         self.overlay.set_active(active)
+        self.track_overlay.set_aspect(aspect)
         self._relayout_overlay()
+
+    def set_track_overlay(
+        self, keyframes: list, source_size: tuple[int, int], aspect: str
+    ) -> None:
+        self.track_overlay.set_track(keyframes, source_size, aspect)
+
+    def clear_track_overlay(self) -> None:
+        self.track_overlay.clear_track()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -194,6 +299,7 @@ class VideoPlayer(QWidget):
     def _relayout_overlay(self) -> None:
         if hasattr(self, "overlay"):
             self.overlay.setGeometry(self.video_widget.rect())
+            self.track_overlay.setGeometry(self.video_widget.rect())
             self.placeholder.setGeometry(self.video_widget.rect())
 
     @property
@@ -226,6 +332,7 @@ class VideoPlayer(QWidget):
     def clear(self) -> None:
         self.player.stop()
         self.player.setSource(QUrl())
+        self.clear_track_overlay()
         self.placeholder.setVisible(True)
         self._set_controls_enabled(False)
 
@@ -286,6 +393,8 @@ class VideoPlayer(QWidget):
         if not self._seeking:
             self._sync_slider(ms)
         self.time_label.setText(format_timecode(ms / 1000))
+        if self.track_overlay.active:
+            self.track_overlay.set_position(ms / 1000.0)
         self.positionChanged.emit(ms)
 
     def _sync_slider(self, ms: int) -> None:

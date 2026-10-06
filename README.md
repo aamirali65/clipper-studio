@@ -35,6 +35,11 @@ Phase 6 auto-clip detection: the AUTO page finds clip-worthy moments from a
 media's transcript - heuristic scoring always, optional Ollama AI ranking -
 then previews or adds the picked highlights to the timeline as clips.
 
+Phase 7 smart crop: the SMART page face-tracks a media file locally (YuNet
+via OpenCV, no cloud), stores a focus track in the project, shows the framing
+and export crop window live on the preview, and exports that follow the
+tracked subject via an FFmpeg sendcmd crop instead of always center-cropping.
+
 ## Requirements
 
 - Windows 10/11
@@ -111,6 +116,7 @@ python tests\test_queue_settings.py  # export queue worker + settings persistenc
 python tests\test_captions.py        # SRT round-trip, caption DB, burn-in export, captions page
 python tests\test_ai.py              # prompt builders, Ollama service, AI page, live chat (skips if no server)
 python tests\test_autoclip.py        # highlight units/scoring/NMS, transcript cache, AUTO page, real worker run
+python tests\test_smartcrop.py       # crop math/sendcmd, track DB, SMART page, real face track + FFmpeg export
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -186,6 +192,21 @@ so what you see on the timeline is exactly what gets exported.
 5. Clip naming, timeline positions, undo entries and export behave exactly
    like clips added by hand
 
+### Smart crop (Phase 7)
+
+1. Open the **SMART** page, pick a media file and press **Track faces** -
+   frames are sampled locally with OpenCV's YuNet detector (model bundled in
+   `assets/`), smoothed into keyframes and stored in the project database
+2. The track status shows keyframes/hits; **Clear track** removes it
+3. Tick **Show framing on preview** to draw the tracked face box and the
+   export crop window over the video while you play or scrub
+4. Exports follow the track automatically: the export dialog offers
+   **Smart crop (follow tracked subject)** when a track exists, and the
+   SETTINGS page has a default switch for queued/batch exports
+5. Smart crop renders with an FFmpeg `sendcmd` filter that moves the crop
+   window over the clip; media without a track (or without faces) fall back
+   to the classic center crop
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -215,7 +236,7 @@ clipper-studio/
 │   ├── ui/                  # widgets only (no shell commands, no SQL)
 │   │   ├── main_window.py   # composition, actions, shortcuts, orchestration
 │   │   ├── dashboard.py     # startup screen + recent projects
-│   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / AUTO / EXPORT nav
+│   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / AUTO / SMART / EXPORT nav
 │   │   ├── media_panel.py   # import + YouTube download + media cards
 │   │   ├── video_player.py  # QMediaPlayer preview + aspect framing overlay
 │   │   ├── timeline.py      # multi-clip timeline: split/move/drag, zoom, undo support
@@ -226,6 +247,7 @@ clipper-studio/
 │   │   ├── captions_panel.py# CAPTIONS page: transcript segments + transcribe
 │   │   ├── ai_panel.py      # AI page: local Ollama chat + quick actions
 │   │   ├── auto_panel.py    # AUTO page: highlight search + review + add clips
+│   │   ├── smart_panel.py   # SMART page: face track analysis + preview overlay
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
 │   │   ├── status_bar.py    # timecode, aspect, export button
@@ -233,12 +255,15 @@ clipper-studio/
 │   ├── services/            # FFmpegService, VideoService, YouTubeService,
 │   │                        # ExportService, ExportQueueWorker, SettingsService,
 │   │                        # ProjectService, CaptionService, OllamaService,
-│   │                        # AiService (prompt builders), HighlightService
+│   │                        # AiService (prompt builders), HighlightService,
+│   │                        # FaceTrackService (YuNet detection + crop math)
 │   ├── database/            # database.py (SQLite schema) + repositories.py (all SQL)
 │   ├── models/              # Pydantic: Project, MediaItem, Clip, ExportJob,
-│   │                        # CaptionSegment, HighlightCandidate, AppSettings, settings
+│   │                        # CaptionSegment, HighlightCandidate, TrackKeyframe,
+│   │                        # AppSettings, settings
 │   ├── workers/             # QThread: probe, download, metadata, export,
-│   │                        # transcribe, ollama chat + model list, auto-clip
+│   │                        # transcribe, ollama chat + model list, auto-clip,
+│   │                        # smart face track
 │   └── utils/               # paths, logging, ffmpeg discovery, timecode
 ├── tests/
 ├── projects/                # workspaces: <name>/media, thumbnails, exports, cache, <name>.clipper
@@ -282,7 +307,9 @@ workspace can be moved as long as external media files are relocated too.
   ranking is optional and only runs when ticked; without Ollama the page
   still works with heuristic scoring. Scores are relative within one batch,
   not absolute quality numbers.
-- Smart crop is center-crop; face/subject tracking is Phase 7.
+- Smart crop tracks faces (YuNet), not arbitrary subjects: a media where the
+  face leaves the frame, or faceless footage, falls back to center-cropping;
+  tracking samples ~1.5 fps, so very fast motion can lag slightly.
 - YouTube download uses yt-dlp defaults (no cookies, no API key). Private or
   region-locked videos will fail with the reported yt-dlp error.
 - Paths are resolved from the repository root (or the frozen EXE folder);

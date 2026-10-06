@@ -28,12 +28,15 @@ from app.database.repositories import (
     ClipRepository,
     MediaRepository,
     TranscriptRepository,
+    TrackRepository,
 )
 from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, Clip
 from app.models.media import MediaItem, MediaKind, MediaProbeResult
 from app.models.project import Project, utc_now
 from app.models.queue import JOB_RUNNING, ExportJob
+from app.models.track import TrackKeyframe
 from app.services.ai_service import action_prompt, build_messages, project_context
+from app.services.face_track_service import availability as smart_availability
 from app.services.caption_service import whisper_available, write_srt
 from app.services.export_queue import ExportQueueWorker
 from app.services.ffmpeg_service import FFmpegService
@@ -53,6 +56,7 @@ from app.ui.project_panel import EditorPanel, ExportPanel, ProjectPanel
 from app.ui.queue_panel import QueuePanel
 from app.ui.settings_panel import SettingsPanel
 from app.ui.sidebar import Sidebar
+from app.ui.smart_panel import SmartPanel
 from app.ui.status_bar import StatusBar
 from app.ui.timeline import Timeline
 from app.ui.video_player import VideoPlayer
@@ -70,6 +74,7 @@ from app.workers.ollama_worker import ModelsWorker, OllamaWorker
 from app.workers.probe_worker import ProbeWorker
 from app.workers.transcribe_worker import TranscribeWorker
 from app.workers.autoclip_worker import AutoClipWorker
+from app.workers.smart_track_worker import SmartTrackWorker
 
 log = get_logger("main_window")
 
@@ -82,6 +87,7 @@ PAGE_SETTINGS = 5
 PAGE_CAPTIONS = 6
 PAGE_AI = 7
 PAGE_AUTO = 8
+PAGE_SMART = 9
 
 SEEK_STEP_SECONDS = 5.0
 MIN_CLIP_SECONDS = 0.05
@@ -97,6 +103,7 @@ PAGE_INDEX = {
     "captions": PAGE_CAPTIONS,
     "ai": PAGE_AI,
     "auto": PAGE_AUTO,
+    "smart": PAGE_SMART,
 }
 
 
@@ -134,6 +141,7 @@ class MainWindow(QMainWindow):
         self._models_worker: ModelsWorker | None = None
         self._auto_worker: AutoClipWorker | None = None
         self._auto_project_path: str | None = None
+        self._smart_worker: SmartTrackWorker | None = None
 
         self.queue_worker = ExportQueueWorker(self)
         self.queue_worker.jobAdded.connect(self._on_queue_added)
@@ -216,6 +224,7 @@ class MainWindow(QMainWindow):
         self.captions_panel = CaptionsPanel()
         self.ai_panel = AIPanel()
         self.auto_panel = AutoPanel()
+        self.smart_panel = SmartPanel()
         self.player = VideoPlayer()
         self.timeline = Timeline()
         self.inspector = Inspector()
@@ -250,6 +259,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.captions_panel)  # PAGE_CAPTIONS
         self.pages.addWidget(self.ai_panel)        # PAGE_AI
         self.pages.addWidget(self.auto_panel)      # PAGE_AUTO
+        self.pages.addWidget(self.smart_panel)      # PAGE_SMART
         columns.addWidget(self.pages)
 
         center = QVBoxLayout()
@@ -345,6 +355,12 @@ class MainWindow(QMainWindow):
         self.auto_panel.clearRequested.connect(self._on_auto_clear)
         self.auto_panel.mediaChanged.connect(self._on_auto_media_changed)
 
+        self.smart_panel.analyzeRequested.connect(self._start_smart_analysis)
+        self.smart_panel.cancelRequested.connect(self._cancel_smart_analysis)
+        self.smart_panel.clearRequested.connect(self._on_smart_clear)
+        self.smart_panel.mediaChanged.connect(self._on_smart_media_changed)
+        self.smart_panel.overlayChanged.connect(self._on_smart_overlay)
+
     def _build_shortcuts(self) -> None:
         def add(key: str, slot, name: str) -> None:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -399,6 +415,8 @@ class MainWindow(QMainWindow):
             self._refresh_ai_models()
         elif key == "auto":
             self._refresh_auto_panel()
+        elif key == "smart":
+            self._refresh_smart_panel()
         elif key == "media":
             if len(self.media_panel.items()) != len(self.project.media):
                 self.media_panel.set_media(self.project.media)
@@ -560,6 +578,7 @@ class MainWindow(QMainWindow):
         self.captions_panel.set_language_value(defaults.whisper_language)
         self._refresh_captions_panel()
         self._refresh_auto_panel()
+        self._refresh_smart_panel()
 
         self._push_status(message or f"Opened {project.name}")
         log.info("project loaded into window: %s", project.name)
@@ -690,6 +709,7 @@ class MainWindow(QMainWindow):
         self.export_panel.refresh(clip, self.project, self.status_bar.aspect)
         self.project_panel.refresh(self.project)
         self._committed_range = (clip.start, clip.end)
+        self._apply_smart_overlay()
         self._push_status(f"Loaded {item.name}  -  {format_clock(self.duration)}")
 
     def _new_clip_for_media(self, item: MediaItem) -> Clip:
@@ -1504,6 +1524,7 @@ class MainWindow(QMainWindow):
             self._export_dialog.raise_()
             return
         captions_srt = self._write_clip_srt(self.current_clip)
+        smart_track = self._load_track_keys(media.id or 0)
         dialog = ExportDialog(
             self.project,
             self.current_clip,
@@ -1512,6 +1533,8 @@ class MainWindow(QMainWindow):
             output_dir=self.settings_service.settings.output_dir,
             captions_srt=captions_srt,
             burn_captions=self.settings_service.settings.burn_captions,
+            smart_track=smart_track,
+            smart_crop_default=self.settings_service.settings.smart_crop,
         )
         self._export_dialog = dialog
         dialog.exec()
@@ -1531,6 +1554,7 @@ class MainWindow(QMainWindow):
                 clip,
                 output_dir=output_dir,
                 captions_srt=captions_srt or "",
+                smart_crop=self.settings_service.settings.smart_crop,
             )
             if job is not None:
                 count += 1
@@ -2182,6 +2206,194 @@ class MainWindow(QMainWindow):
         self.auto_panel.set_candidates([])
         self.auto_panel.set_status("")
 
+    # --------------------------------------------------------- smart crop
+    def _load_track(self, media_id: int):
+        if self.project is None or media_id <= 0:
+            return None
+        database = ProjectDatabase(self.project.path)
+        try:
+            return TrackRepository(database).get(media_id)
+        finally:
+            database.close()
+
+    def _load_track_keys(self, media_id: int) -> list[TrackKeyframe] | None:
+        info = self._load_track(media_id)
+        if info is None or not info.keyframes:
+            return None
+        return info.keyframes
+
+    def _refresh_smart_panel(self) -> None:
+        if self.project is None or self.smart_panel.busy:
+            return
+        preferred = self.current_media.id if self.current_media else None
+        self.smart_panel.set_media(self.project.media, preferred)
+        self._refresh_smart_track_status()
+
+    def _refresh_smart_track_status(self) -> None:
+        media_id = self.smart_panel.selected_media_id()
+        if self.project is None or media_id is None:
+            self.smart_panel.set_track_status("No media selected.")
+            return
+        info = self._load_track(media_id)
+        if info is None or not info.keyframes:
+            text = "No face track yet - press Track faces to analyze this media."
+            if info is not None and info.hits == 0:
+                text = "Last run found no faces - exports will center-crop."
+            self.smart_panel.set_track_status(text)
+            return
+        percent = int(round(info.hits * 100 / max(1, info.frames)))
+        self.smart_panel.set_track_status(
+            f"Track: {len(info.keyframes)} keyframes  -  "
+            f"{info.hits}/{info.frames} frames with a face ({percent}%, "
+            f"{info.detector})"
+        )
+
+    def _on_smart_media_changed(self, _media_id: int) -> None:
+        if not self.smart_panel.busy:
+            self._refresh_smart_track_status()
+            self._apply_smart_overlay()
+
+    def _on_smart_overlay(self, checked: bool) -> None:
+        if checked:
+            self._apply_smart_overlay()
+        else:
+            self.player.clear_track_overlay()
+
+    def _apply_smart_overlay(self) -> None:
+        if not self.smart_panel.overlay_checked() or self.project is None:
+            self.player.clear_track_overlay()
+            return
+        media_id = self.smart_panel.selected_media_id()
+        media = (
+            self.project.media_by_id(media_id) if media_id is not None else None
+        )
+        if media is None or not (media.width and media.height):
+            self.player.clear_track_overlay()
+            return
+        keys = self._load_track_keys(media.id or 0)
+        if not keys:
+            self.player.clear_track_overlay()
+            return
+        self.player.set_track_overlay(
+            keys, (media.width, media.height), self.status_bar.aspect
+        )
+
+    def _start_smart_analysis(self) -> None:
+        if not self._require_project():
+            return
+        if self._smart_worker is not None and self._smart_worker.isRunning():
+            self._push_status("Face tracking is already running")
+            return
+        ok, message = smart_availability()
+        if not ok:
+            self.smart_panel.set_status(message, error=True)
+            return
+        media_id = self.smart_panel.selected_media_id()
+        media = (
+            self.project.media_by_id(media_id) if media_id is not None else None
+        )
+        if media is None:
+            self.smart_panel.set_status("Select a media file first", error=True)
+            return
+        if media.duration <= 0:
+            self.smart_panel.set_status(
+                "Media duration unknown - reopen the project to probe it",
+                error=True,
+            )
+            return
+        source = media.resolve_path(self.project.directory)
+        if not source.exists():
+            source = Path(media.source_path)
+        if not source.exists():
+            self.smart_panel.set_status(
+                f"Source file not found: {media.source_path}", error=True
+            )
+            return
+        worker = SmartTrackWorker(
+            media_id=media.id or 0,
+            media_path=source,
+            duration=media.duration,
+            parent=self,
+        )
+        worker.progress.connect(self._on_smart_progress)
+        worker.completed.connect(self._on_smart_completed)
+        worker.error.connect(self._on_smart_error)
+        self._smart_worker = worker
+        self._track_worker(worker)
+        self.smart_panel.set_busy(True)
+        self.smart_panel.set_status("Starting face tracking...")
+        worker.start()
+
+    def _cancel_smart_analysis(self) -> None:
+        if self._smart_worker is not None and self._smart_worker.isRunning():
+            self._smart_worker.cancel()
+            self.smart_panel.set_status("Cancelling...")
+
+    def _on_smart_progress(self, message: str) -> None:
+        self.smart_panel.set_status(message)
+
+    def _on_smart_completed(self, payload: object) -> None:
+        self.smart_panel.set_busy(False)
+        data = payload if isinstance(payload, dict) else {}
+        media_id = int(
+            data.get("media_id") or self.smart_panel.selected_media_id() or 0
+        )
+        keyframes: list[TrackKeyframe] = []
+        for entry in data.get("keyframes") or []:
+            try:
+                keyframes.append(TrackKeyframe(**entry))
+            except (TypeError, ValueError):
+                continue
+        hits = int(data.get("hits") or 0)
+        if self.project is not None and media_id > 0:
+            database = ProjectDatabase(self.project.path)
+            try:
+                TrackRepository(database).upsert(
+                    media_id,
+                    keyframes,
+                    detector=str(data.get("detector") or ""),
+                    frames=int(data.get("frames") or 0),
+                    hits=hits,
+                    width=int(data.get("width") or 0),
+                    height=int(data.get("height") or 0),
+                )
+            finally:
+                database.close()
+        if hits:
+            message = f"Tracked {len(keyframes)} keyframes ({hits} face hits)"
+        else:
+            message = "No faces found - exports will center-crop"
+        self.smart_panel.set_status(message)
+        self._refresh_smart_track_status()
+        self._apply_smart_overlay()
+        self._push_status(f"Smart crop: {message}")
+
+    def _on_smart_error(self, message: str) -> None:
+        self.smart_panel.set_busy(False)
+        if "cancel" in message.lower():
+            self.smart_panel.set_status("Cancelled")
+            self._push_status("Face tracking cancelled")
+        else:
+            self.smart_panel.set_status(message, error=True)
+            log.warning("face tracking failed: %s", message)
+
+    def _on_smart_clear(self) -> None:
+        if not self._require_project():
+            return
+        media_id = self.smart_panel.selected_media_id()
+        if media_id is None:
+            self.smart_panel.set_status("No media selected.", error=True)
+            return
+        database = ProjectDatabase(self.project.path)
+        try:
+            TrackRepository(database).delete_for_media(media_id)
+        finally:
+            database.close()
+        self.smart_panel.set_status("Track cleared")
+        self._refresh_smart_track_status()
+        self._apply_smart_overlay()
+        self._push_status("Face track cleared")
+
     # ------------------------------------------------------------ guards
     def _typing_focus(self) -> bool:
         focused = QApplication.focusWidget()
@@ -2284,6 +2496,9 @@ class MainWindow(QMainWindow):
         if self._auto_worker is not None and self._auto_worker.isRunning():
             self._auto_worker.cancel()
             self._auto_worker.wait(4000)
+        if self._smart_worker is not None and self._smart_worker.isRunning():
+            self._smart_worker.cancel()
+            self._smart_worker.wait(4000)
         self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():

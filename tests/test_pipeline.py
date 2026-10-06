@@ -116,7 +116,7 @@ def test_project_lifecycle():
     return project, media, clip
 
 
-def test_export(project, media, clip):
+def run_export(project, media, clip):
     service = ExportService()
     request = ExportRequest(
         source=SAMPLE,
@@ -189,7 +189,7 @@ def main():
     test_clip_validation()
     test_probe()
     project, media, clip = test_project_lifecycle()
-    test_export(project, media, clip)
+    run_export(project, media, clip)
     print("\nALL TESTS PASSED")
 
 

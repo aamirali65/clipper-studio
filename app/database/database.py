@@ -73,9 +73,23 @@ CREATE TABLE IF NOT EXISTS media_transcripts (
     FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS media_tracks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id INTEGER NOT NULL UNIQUE,
+    keyframes TEXT NOT NULL DEFAULT '[]',
+    detector TEXT NOT NULL DEFAULT '',
+    frames INTEGER NOT NULL DEFAULT 0,
+    hits INTEGER NOT NULL DEFAULT 0,
+    width INTEGER NOT NULL DEFAULT 0,
+    height INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (media_id) REFERENCES media(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_clips_media ON clips(media_id);
 CREATE INDEX IF NOT EXISTS idx_captions_clip ON captions(clip_id);
 CREATE INDEX IF NOT EXISTS idx_transcripts_media ON media_transcripts(media_id);
+CREATE INDEX IF NOT EXISTS idx_tracks_media ON media_tracks(media_id);
 """
 
 

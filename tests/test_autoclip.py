@@ -282,7 +282,7 @@ def test_gui_auto_page() -> None:
 
     assert "auto" in window.sidebar._buttons, "auto page missing from sidebar"
     assert window.sidebar._buttons["auto"].isEnabled(), "auto page disabled"
-    assert window.pages.count() == 9, window.pages.count()
+    assert window.pages.count() == 10, window.pages.count()
     window.sidebar.select("auto")
     assert window.pages.currentIndex() == 8
 
