@@ -328,6 +328,7 @@ class MainWindow(QMainWindow):
         self.status_bar.exportRequested.connect(self.open_export_dialog)
         self.status_bar.aspectChanged.connect(self._on_aspect_changed)
         self.status_bar.playToggled.connect(self.player.toggle_play)
+        self.status_bar.phoneToggled.connect(self._on_phone_preview)
 
         self.project_panel.saveRequested.connect(self.save_project)
         self.project_panel.saveAsRequested.connect(self.save_project_as)
@@ -859,10 +860,39 @@ class MainWindow(QMainWindow):
         self._activate_media(target)
         self._push_status(f"Downloaded {target.name}")
 
+        run = self._autopilot
+        if run is not None and run.get("stage") == "download":
+            self._autopilot_after_download(target)
+
+    def _autopilot_after_download(self, media: MediaItem) -> None:
+        """Continue an autopilot run on the freshly downloaded media."""
+        run = self._autopilot
+        if run is None:
+            return
+        self.autopilot_panel.set_media(self.project.media, media.id or 0)
+        source = media.resolve_path(self.project.directory)
+        if not source.exists():
+            source = Path(media.source_path)
+        run["media"] = media
+        run["media_id"] = media.id or 0
+        run["source"] = source
+        run["stage"] = "analyze"
+        self.autopilot_panel.set_status(f"Analyzing {media.name}...")
+        self._autopilot_begin_analysis()
+
     def _on_download_error(self, message: str) -> None:
         self._download_worker = None
         self.media_panel.set_download_error(message)
         self._push_status(f"Download failed: {message}")
+        run = self._autopilot
+        if run is not None and run.get("stage") == "download":
+            self.autopilot_panel.set_stage(0, "failed", message)
+            if message == "cancelled" or "cancel" in message.lower():
+                self._finish_autopilot("Autopilot cancelled during download.")
+            else:
+                self._finish_autopilot(
+                    f"Autopilot stopped during download: {message}"
+                )
 
     def cancel_download(self) -> None:
         if self._download_worker is not None and self._download_worker.isRunning():
@@ -1454,6 +1484,15 @@ class MainWindow(QMainWindow):
                 self.current_clip, self.project, aspect
             )
 
+    def _on_phone_preview(self, checked: bool) -> None:
+        if checked and self.status_bar.aspect != "9:16":
+            self._on_aspect_changed("9:16")
+        self.player.set_phone_preview(checked)
+        if checked:
+            self._push_status("Phone preview on - 9:16 mobile framing")
+        else:
+            self._push_status("Phone preview off")
+
     def _refresh_clip_list(self) -> None:
         if self.project is None:
             return
@@ -1561,15 +1600,19 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- queue
     def _enqueue_clips(
-        self, clips: list[Clip], smart_crop: bool | None = None
+        self,
+        clips: list[Clip],
+        smart_crop: bool | None = None,
+        burn: bool | None = None,
     ) -> list[ExportJob]:
-        """Queue clips for export; ``smart_crop`` None -> settings default."""
+        """Queue clips for export; None -> settings default for both flags."""
         if self.project is None:
             return []
         output_dir = self.settings_service.settings.output_dir
-        burn = self.settings_service.settings.burn_captions
         if smart_crop is None:
             smart_crop = self.settings_service.settings.smart_crop
+        if burn is None:
+            burn = self.settings_service.settings.burn_captions
         jobs: list[ExportJob] = []
         for clip in clips:
             captions_srt = self._write_clip_srt(clip) if burn else None
@@ -1798,11 +1841,11 @@ class MainWindow(QMainWindow):
     def _on_caption_export_srt(self) -> None:
         if not self._require_project() or self.current_clip is None:
             return
-        segments = self.captions_panel.segments
+        clip = self.current_clip
+        segments = self._clip_srt_segments(clip)
         if not segments:
             self._push_status("No captions to export")
             return
-        clip = self.current_clip
         default = self.project.exports_dir / f"{safe_name(clip.name)}.srt"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export SRT", str(default), "SubRip subtitles (*.srt)"
@@ -1846,11 +1889,39 @@ class MainWindow(QMainWindow):
             database.close()
         self._push_status("Caption updated")
 
+    def _clip_srt_segments(self, clip: Clip | None) -> list:
+        """Clip's captions rebased to clip-local time (for SRT / burn-in).
+
+        Stored caption times match the source timeline (absolute); exports
+        trim with ``-ss`` so the SRT must start at the clip's own zero.
+        Segments outside the clip range are dropped, partial overlaps are
+        clamped.
+        """
+        if self.project is None or clip is None or clip.id is None:
+            return []
+        segments = self._load_captions(clip.id)
+        if not segments:
+            return []
+        duration = max(0.0, clip.end - clip.start)
+        rebased: list = []
+        for segment in segments:
+            if segment.end <= clip.start or segment.start >= clip.end:
+                continue
+            start = max(0.0, segment.start - clip.start)
+            end = min(duration, segment.end - clip.start)
+            if end - start < 0.01:  # drop float-epsilon slivers
+                continue
+            item = segment.model_copy()
+            item.start = start
+            item.end = end
+            rebased.append(item)
+        return rebased
+
     def _write_clip_srt(self, clip: Clip | None) -> Path | None:
         """Snapshot a clip's captions to an SRT file (for burn-in exports)."""
         if self.project is None or clip is None or clip.id is None:
             return None
-        segments = self._load_captions(clip.id)
+        segments = self._clip_srt_segments(clip)
         if not segments:
             return None
         target = self.project.cache_dir / f"captions_clip_{clip.id}.srt"
@@ -2191,13 +2262,18 @@ class MainWindow(QMainWindow):
             self._push_status(f"Added {len(created)} highlight clip(s)")
 
     def _create_clips_for_candidates(
-        self, media: MediaItem, candidates: list, label: str = "Add highlight"
+        self,
+        media: MediaItem,
+        candidates: list,
+        label: str = "Add highlight",
+        aspect: str | None = None,
     ) -> list[Clip]:
         """Create timeline clips from highlight candidates (AUTO + autopilot)."""
         if self.project is None:
             return []
         order = max((c.order for c in self.project.clips), default=-1)
-        aspect = self.status_bar.aspect
+        if aspect not in ASPECT_RATIOS:
+            aspect = self.status_bar.aspect
         created: list[Clip] = []
         number = len(self.project.clips) + 1
         for candidate in candidates:
@@ -2464,6 +2540,20 @@ class MainWindow(QMainWindow):
         if self._smart_worker is not None and self._smart_worker.isRunning():
             self._push_status("Face tracking is running - wait for it first")
             return
+        if self._download_worker is not None and self._download_worker.isRunning():
+            self._push_status("A download is already running")
+            return
+        min_len = self.autopilot_panel.min_len()
+        max_len = self.autopilot_panel.max_len()
+        if max_len <= min_len:
+            self.autopilot_panel.set_status(
+                "Max clip length must be greater than min", error=True
+            )
+            return
+        url = self.autopilot_panel.youtube_url()
+        if url:
+            self._start_autopilot_download(url, min_len, max_len)
+            return
         media_id = self.autopilot_panel.selected_media_id()
         media = (
             self.project.media_by_id(media_id) if media_id is not None else None
@@ -2473,63 +2563,131 @@ class MainWindow(QMainWindow):
                 "Select a media file first", error=True
             )
             return
-        if media.duration <= 0:
-            self.autopilot_panel.set_status(
-                "Media duration unknown - reopen the project to probe it",
-                error=True,
-            )
-            return
         source = media.resolve_path(self.project.directory)
         if not source.exists():
             source = Path(media.source_path)
-        if not source.exists():
-            self.autopilot_panel.set_status(
-                f"Source file not found: {media.source_path}", error=True
-            )
-            return
-        min_len = self.autopilot_panel.min_len()
-        max_len = self.autopilot_panel.max_len()
-        if max_len <= min_len:
-            self.autopilot_panel.set_status(
-                "Max clip length must be greater than min", error=True
-            )
-            return
-        cached, language = self._load_transcript(media.id or 0)
-        if not cached and not whisper_available():
-            self.autopilot_panel.set_status(
-                "faster-whisper is not installed and there is no cached "
-                "transcript - run: python -m pip install faster-whisper",
-                error=True,
-            )
-            return
+        self._autopilot = self._autopilot_new_run(
+            media=media, source=source, min_len=min_len, max_len=max_len
+        )
+        self._autopilot_begin_analysis()
 
-        settings = self.settings_service.settings
-        self._autopilot = {
-            "media": media,
-            "media_id": media.id or 0,
-            "source": source,
-            "track": self.autopilot_panel.track_faces(),
-            "export": self.autopilot_panel.export_when_done(),
+    def _autopilot_new_run(self, **fields) -> dict:
+        """Reset the AUTOPILOT page UI and build a fresh run state."""
+        panel = self.autopilot_panel
+        run = {
+            "media": None,
+            "media_id": 0,
+            "source": None,
+            "url": "",
+            "min_len": panel.min_len(),
+            "max_len": panel.max_len(),
+            "track": panel.track_faces(),
+            "export": panel.export_when_done(),
+            "burn": panel.burn_captions(),
+            "aspect": panel.aspect(),
             "exported_track": False,
             "created": [],
             "job_ids": [],
             "early_errors": 0,
             "stage": "analyze",
         }
-        self.autopilot_panel.reset_stages()
-        self.autopilot_panel.set_report("")
-        self.autopilot_panel.set_busy(True)
+        run.update(fields)
+        panel.reset_stages()
+        panel.set_report("")
+        panel.set_busy(True)
+        return run
+
+    def _start_autopilot_download(
+        self, url: str, min_len: float, max_len: float
+    ) -> None:
+        try:
+            url = YouTubeService.validate(url)
+        except InvalidYouTubeURL as exc:
+            self.autopilot_panel.set_status(str(exc), error=True)
+            return
+        self._autopilot = self._autopilot_new_run(
+            url=url, min_len=min_len, max_len=max_len, stage="download"
+        )
+        self.autopilot_panel.set_stage(
+            0, "running", "downloading from YouTube..."
+        )
+        self.autopilot_panel.set_status("Downloading from YouTube...")
+        self.media_panel.set_downloading(True)
+        worker = DownloadWorker(
+            url, self.project.media_dir, service=self.youtube_service
+        )
+        worker.progress.connect(self._on_download_progress)
+        worker.progress.connect(self._on_autopilot_download_progress)
+        worker.completed.connect(self._on_download_completed)
+        worker.error.connect(self._on_download_error)
+        self._download_worker = worker
+        self._track_worker(worker)
+        worker.start()
+        self._push_status("Autopilot: downloading from YouTube...")
+
+    def _on_autopilot_download_progress(self, percent: float, detail: str) -> None:
+        run = self._autopilot
+        if run is None or run.get("stage") != "download":
+            return
+        text = f"downloading {int(percent)}%"
+        if detail:
+            text += f" - {detail}"
+        self.autopilot_panel.set_stage(0, "running", text)
+        self.autopilot_panel.set_status(f"Downloading {int(percent)}%")
+
+    def _autopilot_begin_analysis(self) -> None:
+        """Validate the run's media and start the analysis worker."""
+        run = self._autopilot
+        if run is None:
+            return
+        media = run.get("media")
+        if media is None:
+            self.autopilot_panel.set_stage(0, "failed", "no media")
+            self._finish_autopilot("Autopilot stopped: media is missing.")
+            return
+        if (media.duration or 0) <= 0:
+            message = "Media duration unknown - reopen the project to probe it"
+            self.autopilot_panel.set_stage(0, "failed", "duration unknown")
+            self._finish_autopilot(f"Autopilot stopped: {message}.")
+            return
+        source = run.get("source")
+        if source is None:
+            source = media.resolve_path(self.project.directory)
+            if not source.exists():
+                source = Path(media.source_path)
+            run["source"] = source
+        if not Path(source).exists():
+            message = f"Source file not found: {media.source_path}"
+            self.autopilot_panel.set_stage(0, "failed", "source missing")
+            self._finish_autopilot(f"Autopilot stopped: {message}.")
+            return
+        cached, language = self._load_transcript(media.id or 0)
+        if not cached and not whisper_available():
+            message = (
+                "faster-whisper is not installed and there is no cached "
+                "transcript - run: python -m pip install faster-whisper"
+            )
+            self.autopilot_panel.set_stage(
+                0, "failed", "transcript unavailable"
+            )
+            self._finish_autopilot(f"Autopilot stopped: {message}")
+            return
+        aspect = run.get("aspect") or self.status_bar.aspect
+        if aspect in ASPECT_RATIOS and aspect != self.status_bar.aspect:
+            self._on_aspect_changed(aspect)
+        run["stage"] = "analyze"
         self.autopilot_panel.set_stage(0, "running")
         self.autopilot_panel.set_status("Starting analysis...")
 
+        settings = self.settings_service.settings
         worker = AutoClipWorker(
             media_id=media.id or 0,
-            media_path=source,
+            media_path=Path(source),
             media_duration=media.duration,
             cached_transcript=cached,
             cached_language=language,
-            min_len=min_len,
-            max_len=max_len,
+            min_len=float(run.get("min_len") or 15),
+            max_len=float(run.get("max_len") or 45),
             count=self.autopilot_panel.clip_count(),
             use_ai=self.autopilot_panel.use_ai(),
             ollama_url=settings.ollama_url,
@@ -2551,6 +2709,10 @@ class MainWindow(QMainWindow):
     def _cancel_autopilot(self) -> None:
         run = self._autopilot
         if run is None:
+            return
+        if run.get("stage") == "download":
+            self.autopilot_panel.set_status("Cancelling download...")
+            self.cancel_download()
             return
         worker = self._autopilot_worker
         if worker is not None and worker.isRunning():
@@ -2601,7 +2763,10 @@ class MainWindow(QMainWindow):
             self._finish_autopilot(f"Autopilot stopped: {message}.")
             return
         created = self._create_clips_for_candidates(
-            run["media"], candidates, label="Autopilot add"
+            run["media"],
+            candidates,
+            label="Autopilot add",
+            aspect=run.get("aspect"),
         )
         if not created:
             self.autopilot_panel.set_stage(
@@ -2614,6 +2779,12 @@ class MainWindow(QMainWindow):
         run["created"] = created
         source = "transcribed" if data.get("transcribed") else "cached transcript"
         detail = f"{len(candidates)} highlights -> {len(created)} clips ({source})"
+        if run.get("burn"):
+            transcript = list(data.get("transcript") or [])
+            if not transcript:
+                transcript, _ = self._load_transcript(int(run["media_id"]))
+            captioned = self._derive_clip_captions(transcript, created)
+            detail += f", {captioned} captioned"
         if note:
             detail += f"; {note}"
         self.autopilot_panel.set_stage(0, "done", detail)
@@ -2627,6 +2798,35 @@ class MainWindow(QMainWindow):
         else:
             self.autopilot_panel.set_stage(1, "skipped", "disabled")
         self._autopilot_enqueue(run)
+
+    def _derive_clip_captions(self, segments: list, clips: list) -> int:
+        """Store the transcript parts inside each new clip as its captions.
+
+        Segment times stay absolute (the same basis as a manual
+        transcription); ``_clip_srt_segments`` rebases at export time.
+        Returns how many clips got captions.
+        """
+        if self.project is None or not segments or not clips:
+            return 0
+        saved = 0
+        database = ProjectDatabase(self.project.path)
+        try:
+            repository = CaptionRepository(database)
+            for clip in clips:
+                if clip.id is None:
+                    continue
+                hits = [
+                    segment.model_copy()
+                    for segment in segments
+                    if segment.end > clip.start and segment.start < clip.end
+                ]
+                if not hits:
+                    continue
+                repository.replace_for_clip(clip.id, hits)
+                saved += 1
+        finally:
+            database.close()
+        return saved
 
     def _start_autopilot_track(self, run: dict) -> None:
         run["stage"] = "track"
@@ -2689,7 +2889,9 @@ class MainWindow(QMainWindow):
             2, "running", f"queueing {len(created)} clips..."
         )
         smart = True if run.get("exported_track") else None
-        jobs = self._enqueue_clips(created, smart_crop=smart)
+        jobs = self._enqueue_clips(
+            created, smart_crop=smart, burn=run.get("burn")
+        )
         early_errors = sum(1 for job in jobs if job.status == JOB_ERROR)
         run["early_errors"] = early_errors
         job_ids = [job.id for job in jobs if job.status != JOB_ERROR]
@@ -2869,6 +3071,8 @@ class MainWindow(QMainWindow):
         if self._autopilot_worker is not None and self._autopilot_worker.isRunning():
             self._autopilot_worker.cancel()
             self._autopilot_worker.wait(4000)
+        if self._download_worker is not None and self._download_worker.isRunning():
+            self._download_worker.cancel()
         self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():

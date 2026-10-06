@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -58,6 +59,17 @@ class AutopilotPanel(QWidget):
         self.media_box.currentIndexChanged.connect(self._on_media_changed)
         root.addWidget(self.media_box)
 
+        self.url_box = QLineEdit()
+        self.url_box.setPlaceholderText(
+            "Paste a YouTube link - imports it, then runs the pipeline"
+        )
+        self.url_box.setClearButtonEnabled(True)
+        self.url_box.setToolTip(
+            "Optional: when filled, the link is downloaded first and the "
+            "pipeline runs on the imported video (overrides the media above)"
+        )
+        root.addWidget(self.url_box)
+
         options = QHBoxLayout()
         options.setSpacing(6)
         self.min_box = QSpinBox()
@@ -81,7 +93,7 @@ class AutopilotPanel(QWidget):
         self.count_box = QSpinBox()
         self.count_box.setRange(1, 20)
         self.count_box.setPrefix("Clips ")
-        self.count_box.setValue(5)
+        self.count_box.setValue(10)
         self.ai_box = QCheckBox("AI rank")
         self.ai_box.setToolTip(
             "Ask the local Ollama model to help pick highlights (same as "
@@ -90,6 +102,33 @@ class AutopilotPanel(QWidget):
         options2.addWidget(self.count_box, 1)
         options2.addWidget(self.ai_box, 1)
         root.addLayout(options2)
+
+        options3 = QHBoxLayout()
+        options3.setSpacing(6)
+        self.aspect_box = QComboBox()
+        aspect_labels = {
+            "9:16": "9:16  TikTok",
+            "16:9": "16:9  YouTube",
+            "1:1": "1:1  Square",
+            "4:5": "4:5  Portrait",
+        }
+        for key in ("9:16", "16:9", "1:1", "4:5"):
+            self.aspect_box.addItem(aspect_labels[key], key)
+        self.aspect_box.setCurrentIndex(self.aspect_box.findData("9:16"))
+        self.aspect_box.setFixedWidth(150)
+        self.aspect_box.setToolTip(
+            "Aspect ratio for the new clips and their export (preview "
+            "follows it)"
+        )
+        self.captions_box = QCheckBox("Burn captions")
+        self.captions_box.setToolTip(
+            "Write captions from the transcript for every new clip (shown "
+            "on the CAPTIONS page) and burn them into the exports"
+        )
+        self.captions_box.setChecked(True)
+        options3.addWidget(self.aspect_box)
+        options3.addWidget(self.captions_box, 1)
+        root.addLayout(options3)
 
         self.track_box = QCheckBox("Track faces before export")
         self.track_box.setToolTip(
@@ -102,7 +141,8 @@ class AutopilotPanel(QWidget):
         self.export_box = QCheckBox("Export the new clips when done")
         self.export_box.setToolTip(
             "Queue every clip this run creates with the current export "
-            "settings (captions burn-in and smart crop follow SETTINGS)"
+            "settings (smart crop follows the track option, captions the "
+            "option above)"
         )
         self.export_box.setChecked(True)
         root.addWidget(self.export_box)
@@ -147,10 +187,11 @@ class AutopilotPanel(QWidget):
         root.addWidget(self.report_label)
 
         hint = QLabel(
-            "One click runs the whole pipeline for the selected media: "
-            "transcribe (first time) + find highlights, add them as clips, "
-            "track faces for smart crop, then queue the exports. Cancel "
-            "stops the current stage (queued exports can be cancelled too)."
+            "Paste a YouTube link (or pick a media file), then one click "
+            "runs the whole pipeline: transcribe (first time) + find "
+            "highlights, add them as clips with captions, track faces for "
+            "smart crop, then queue the exports. Cancel stops the current "
+            "stage (queued exports can be cancelled too)."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #4d4d55; font-size: 10px;")
@@ -180,6 +221,16 @@ class AutopilotPanel(QWidget):
     def selected_media_id(self) -> int | None:
         data = self.media_box.currentData()
         return int(data) if data is not None else None
+
+    def youtube_url(self) -> str:
+        return self.url_box.text().strip()
+
+    def aspect(self) -> str:
+        data = self.aspect_box.currentData()
+        return str(data) if data else "9:16"
+
+    def burn_captions(self) -> bool:
+        return self.captions_box.isChecked()
 
     def min_len(self) -> float:
         return float(self.min_box.value())
@@ -220,10 +271,13 @@ class AutopilotPanel(QWidget):
         self.cancel_button.setEnabled(busy)
         for widget in (
             self.media_box,
+            self.url_box,
             self.min_box,
             self.max_box,
             self.count_box,
             self.ai_box,
+            self.aspect_box,
+            self.captions_box,
             self.export_box,
         ):
             widget.setEnabled(not busy)

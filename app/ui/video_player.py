@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, QElapsedTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -46,6 +46,10 @@ class AspectOverlay(QWidget):
         self._active = active
         self.update()
 
+    @property
+    def active(self) -> bool:
+        return bool(self._active)
+
     def paintEvent(self, event) -> None:
         if not self._active:
             return
@@ -76,6 +80,119 @@ class AspectOverlay(QWidget):
         painter.drawLine(
             int(frame.center().x()), int(frame.top()),
             int(frame.center().x()), int(frame.bottom()),
+        )
+        painter.end()
+
+
+def phone_geometry(
+    width: float, height: float, aspect: str = "9:16", bezel: float | None = None
+) -> tuple[tuple[float, float, float, float], tuple[float, float, float, float]]:
+    """Screen (aspect-correct, centered) and phone body rects as (x, y, w, h).
+
+    The screen is inset by ``bezel`` so the body always fits the widget.
+    """
+    ratio_w, ratio_h = ASPECT_RATIOS.get(aspect, (9, 16))
+    target = ratio_w / max(1, ratio_h)
+    w = float(max(1, width))
+    h = float(max(1, height))
+    if bezel is None:
+        bezel = max(4.0, min(w, h) * 0.03)
+    avail_w = max(1.0, w - 2 * bezel)
+    avail_h = max(1.0, h - 2 * bezel)
+    if avail_w / avail_h > target:
+        frame_h = avail_h
+        frame_w = frame_h * target
+    else:
+        frame_w = avail_w
+        frame_h = frame_w / target
+    x = (w - frame_w) / 2.0
+    y = (h - frame_h) / 2.0
+    screen = (x, y, frame_w, frame_h)
+    body = (x - bezel, y - bezel, frame_w + 2 * bezel, frame_h + 2 * bezel)
+    return screen, body
+
+
+class PhoneOverlay(QWidget):
+    """Paints a phone mockup around the preview (mobile / TikTok look)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._aspect = "9:16"
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return bool(self._active)
+
+    def set_active(self, active: bool) -> None:
+        self._active = bool(active)
+        self.update()
+
+    def set_aspect(self, aspect: str) -> None:
+        if aspect in ASPECT_RATIOS:
+            self._aspect = aspect
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        if not self._active:
+            return
+        w = float(self.width())
+        h = float(self.height())
+        if w <= 1 or h <= 1:
+            return
+        (sx, sy, sw, sh), (bx, by, bw, bh) = phone_geometry(w, h, self._aspect)
+        bezel = sx - bx  # positive bezel thickness
+        screen = QRectF(sx, sy, sw, sh)
+        body = QRectF(bx, by, bw, bh)
+        radius = min(34.0, max(8.0, bezel * 2.4))
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # dim everything outside the phone body
+        dim = QPainterPath()
+        dim.addRoundedRect(body, radius, radius)
+        dim.addRect(QRectF(0, 0, w, h))
+        painter.fillPath(dim, QColor(6, 6, 8, 232))
+
+        # phone body (bezel ring around the transparent screen)
+        ring = QPainterPath()
+        ring.addRoundedRect(body, radius, radius)
+        ring.addRect(screen)
+        painter.fillPath(ring, QColor(13, 13, 16, 255))
+
+        painter.setPen(QPen(QColor(74, 74, 88), 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(body, radius, radius)
+        painter.setPen(QPen(QColor(40, 40, 50, 220), 1))
+        painter.drawRect(screen)
+
+        # speaker slit in the top bezel
+        slit_w = sw * 0.16
+        slit_h = max(2.0, bezel * 0.32)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(66, 66, 78, 255))
+        painter.drawRoundedRect(
+            QRectF(sx + (sw - slit_w) / 2.0, by + bezel * 0.4, slit_w, slit_h),
+            slit_h / 2.0,
+            slit_h / 2.0,
+        )
+
+        # home indicator inside the bottom of the screen
+        bar_w = sw * 0.34
+        bar_h = max(2.0, bezel * 0.26)
+        painter.setBrush(QColor(255, 255, 255, 120))
+        painter.drawRoundedRect(
+            QRectF(
+                sx + (sw - bar_w) / 2.0,
+                sy + sh - bezel * 0.78,
+                bar_w,
+                bar_h,
+            ),
+            bar_h / 2.0,
+            bar_h / 2.0,
         )
         painter.end()
 
@@ -221,6 +338,8 @@ class VideoPlayer(QWidget):
         self.overlay = AspectOverlay(self.video_widget)
         self.overlay.set_active(False)
         self.track_overlay = TrackOverlay(self.video_widget)
+        self.phone_overlay = PhoneOverlay(self.video_widget)
+        self._aspect_before_phone = False
         self._overlay_geom = None
 
         root.addWidget(self.video_widget, 1)
@@ -276,9 +395,29 @@ class VideoPlayer(QWidget):
     # ---- public API ----
     def set_aspect(self, aspect: str, active: bool = True) -> None:
         self.overlay.set_aspect(aspect)
-        self.overlay.set_active(active)
         self.track_overlay.set_aspect(aspect)
+        self.phone_overlay.set_aspect(aspect)
+        if self.phone_overlay.active:
+            # keep the mockup visible; remember the aspect-mask state for restore
+            self._aspect_before_phone = active
+            self.overlay.set_active(False)
+        else:
+            self.overlay.set_active(active)
         self._relayout_overlay()
+
+    def set_phone_preview(self, active: bool) -> None:
+        active = bool(active)
+        if active:
+            self._aspect_before_phone = self.overlay.active
+            self.overlay.set_active(False)
+            self.phone_overlay.set_active(True)
+        else:
+            self.phone_overlay.set_active(False)
+            self.overlay.set_active(self._aspect_before_phone)
+
+    @property
+    def phone_preview(self) -> bool:
+        return self.phone_overlay.active
 
     def set_track_overlay(
         self, keyframes: list, source_size: tuple[int, int], aspect: str
@@ -300,6 +439,7 @@ class VideoPlayer(QWidget):
         if hasattr(self, "overlay"):
             self.overlay.setGeometry(self.video_widget.rect())
             self.track_overlay.setGeometry(self.video_widget.rect())
+            self.phone_overlay.setGeometry(self.video_widget.rect())
             self.placeholder.setGeometry(self.video_widget.rect())
 
     @property

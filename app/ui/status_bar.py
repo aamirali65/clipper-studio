@@ -13,6 +13,7 @@ class StatusBar(QWidget):
     exportRequested = Signal()
     aspectChanged = Signal(str)
     playToggled = Signal()
+    phoneToggled = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -61,6 +62,24 @@ class StatusBar(QWidget):
         self.aspect_box.setFixedWidth(150)
         self.aspect_box.currentIndexChanged.connect(self._on_aspect)
         layout.addWidget(self.aspect_box)
+
+        self.phone_button = QPushButton("Phone")
+        self.phone_button.setCheckable(True)
+        self.phone_button.setFixedSize(58, 30)
+        self.phone_button.setToolTip(
+            "Frame the preview inside a phone mockup - see how the clip "
+            "looks on a phone (switches to 9:16)"
+        )
+        self.phone_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.phone_button.setStyleSheet(
+            "QPushButton { background-color: #26262e; border: 1px solid #33333d;"
+            " border-radius: 6px; color: #c9c9d1; font-size: 11px; }"
+            "QPushButton:hover { background-color: #2f2f39; }"
+            "QPushButton:checked { background-color: #2f6feb;"
+            " border-color: #3b7cf0; color: #ffffff; }"
+        )
+        self.phone_button.toggled.connect(self.phoneToggled)
+        layout.addWidget(self.phone_button)
 
         self.export_button = QPushButton("Export")
         self.export_button.setObjectName("PrimaryButton")

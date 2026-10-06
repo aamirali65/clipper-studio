@@ -45,6 +45,12 @@ file with a single click - transcribe (first time) + find highlights, add
 them as clips, track faces for smart crop, then queue the exports - with a
 stage-by-stage progress report and cancel at every stage.
 
+Phase 9 TikTok mode: paste a YouTube link straight into the AUTOPILOT page
+and the run imports it first, then makes 9:16 clips (10 by default) with
+burned-in captions from the transcript - and the Phone button in the status
+bar frames the preview inside a phone mockup so you can see how a clip will
+look on mobile before exporting.
+
 ## Requirements
 
 - Windows 10/11
@@ -123,6 +129,7 @@ python tests\test_ai.py              # prompt builders, Ollama service, AI page,
 python tests\test_autoclip.py        # highlight units/scoring/NMS, transcript cache, AUTO page, real worker run
 python tests\test_smartcrop.py       # crop math/sendcmd, track DB, SMART page, real face track + FFmpeg export
 python tests\test_autopilot.py       # autopilot page, full analyze-only run, queue-wait reports, enqueue flags
+python tests\test_tiktok.py          # phone mockup geometry, clip-local SRT, YouTube-link run, burn flag
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -218,8 +225,8 @@ so what you see on the timeline is exactly what gets exported.
 1. Open the **AUTOPILOT** page, pick a media file, set min/max clip length,
    clip count and (optionally) AI rank - the same options as the AUTO page
 2. Tick what the run should do: **Track faces before export** and
-   **Export the new clips when done** (captions burn-in and smart crop
-   follow the SETTINGS page), then press **Run autopilot**
+   **Export the new clips when done**, pick the ratio (9:16 by default)
+   and **Burn captions**, then press **Run autopilot**
 3. The stage list updates live: find + add clips (transcribing on the first
    run, cached afterwards), face track, then the export queue with a
    finished/total counter
@@ -227,6 +234,23 @@ so what you see on the timeline is exactly what gets exported.
    the run's queued jobs too
 5. A report line summarizes the run (clips added, track saved, exported /
    failed counts); the new clips are on the timeline like hand-added ones
+
+### YouTube link + phone preview (Phase 9)
+
+1. On the **AUTOPILOT** page, paste a YouTube link in the URL field (the
+   media list stays as the alternative for local files) - the link wins
+   over the selected media when both are set
+2. Press **Run autopilot**: stage one downloads the video into the project
+   (Cancel stops it too), then the normal pipeline runs on the import -
+   analysis, clips, face track, exports
+3. Defaults are tuned for shorts: 10 clips, **9:16 TikTok** ratio, captions
+   burned in from the transcript (they also appear on the CAPTIONS page,
+   editable before export)
+4. Press **Phone** in the bottom status bar to wrap the preview in a phone
+   mockup - it forces 9:16 so you see the exact TikTok framing; press
+   again to return to the normal aspect mask
+5. Captions exported as SRT (CAPTIONS page) and burned into exports are
+   always clip-local: a clip starting at 00:10 gets an SRT starting at 0
 
 ### Keyboard shortcuts
 
@@ -259,7 +283,7 @@ clipper-studio/
 │   │   ├── dashboard.py     # startup screen + recent projects
 │   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / AUTO / SMART / AUTOPILOT / EXPORT nav
 │   │   ├── media_panel.py   # import + YouTube download + media cards
-│   │   ├── video_player.py  # QMediaPlayer preview + aspect framing overlay
+│   │   ├── video_player.py  # QMediaPlayer preview + aspect frame + phone mockup overlays
 │   │   ├── timeline.py      # multi-clip timeline: split/move/drag, zoom, undo support
 │   │   ├── inspector.py     # clip start/end/duration/aspect + validation
 │   │   ├── project_panel.py # project / editor / export pages
@@ -272,7 +296,7 @@ clipper-studio/
 │   │   ├── autopilot_panel.py # AUTOPILOT page: one-click pipeline + stage report
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
-│   │   ├── status_bar.py    # timecode, aspect, export button
+│   │   ├── status_bar.py    # timecode, aspect, phone preview toggle, export button
 │   │   └── theme.py         # dark stylesheet
 │   ├── services/            # FFmpegService, VideoService, YouTubeService,
 │   │                        # ExportService, ExportQueueWorker, SettingsService,
