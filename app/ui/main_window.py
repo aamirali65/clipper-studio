@@ -33,7 +33,13 @@ from app.database.repositories import (
 from app.models.clip import ASPECT_RATIOS, QUALITY_PRESETS, Clip
 from app.models.media import MediaItem, MediaKind, MediaProbeResult
 from app.models.project import Project, utc_now
-from app.models.queue import JOB_RUNNING, ExportJob
+from app.models.queue import (
+    JOB_CANCELLED,
+    JOB_DONE,
+    JOB_ERROR,
+    JOB_RUNNING,
+    ExportJob,
+)
 from app.models.track import TrackKeyframe
 from app.services.ai_service import action_prompt, build_messages, project_context
 from app.services.face_track_service import availability as smart_availability
@@ -57,6 +63,7 @@ from app.ui.queue_panel import QueuePanel
 from app.ui.settings_panel import SettingsPanel
 from app.ui.sidebar import Sidebar
 from app.ui.smart_panel import SmartPanel
+from app.ui.autopilot_panel import AutopilotPanel
 from app.ui.status_bar import StatusBar
 from app.ui.timeline import Timeline
 from app.ui.video_player import VideoPlayer
@@ -88,6 +95,7 @@ PAGE_CAPTIONS = 6
 PAGE_AI = 7
 PAGE_AUTO = 8
 PAGE_SMART = 9
+PAGE_AUTOPILOT = 10
 
 SEEK_STEP_SECONDS = 5.0
 MIN_CLIP_SECONDS = 0.05
@@ -104,6 +112,7 @@ PAGE_INDEX = {
     "ai": PAGE_AI,
     "auto": PAGE_AUTO,
     "smart": PAGE_SMART,
+    "autopilot": PAGE_AUTOPILOT,
 }
 
 
@@ -142,6 +151,8 @@ class MainWindow(QMainWindow):
         self._auto_worker: AutoClipWorker | None = None
         self._auto_project_path: str | None = None
         self._smart_worker: SmartTrackWorker | None = None
+        self._autopilot_worker: AutoClipWorker | SmartTrackWorker | None = None
+        self._autopilot: dict | None = None  # active run state (see _start_autopilot)
 
         self.queue_worker = ExportQueueWorker(self)
         self.queue_worker.jobAdded.connect(self._on_queue_added)
@@ -225,6 +236,7 @@ class MainWindow(QMainWindow):
         self.ai_panel = AIPanel()
         self.auto_panel = AutoPanel()
         self.smart_panel = SmartPanel()
+        self.autopilot_panel = AutopilotPanel()
         self.player = VideoPlayer()
         self.timeline = Timeline()
         self.inspector = Inspector()
@@ -260,6 +272,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.ai_panel)        # PAGE_AI
         self.pages.addWidget(self.auto_panel)      # PAGE_AUTO
         self.pages.addWidget(self.smart_panel)      # PAGE_SMART
+        self.pages.addWidget(self.autopilot_panel)  # PAGE_AUTOPILOT
         columns.addWidget(self.pages)
 
         center = QVBoxLayout()
@@ -361,6 +374,9 @@ class MainWindow(QMainWindow):
         self.smart_panel.mediaChanged.connect(self._on_smart_media_changed)
         self.smart_panel.overlayChanged.connect(self._on_smart_overlay)
 
+        self.autopilot_panel.runRequested.connect(self._start_autopilot)
+        self.autopilot_panel.cancelRequested.connect(self._cancel_autopilot)
+
     def _build_shortcuts(self) -> None:
         def add(key: str, slot, name: str) -> None:
             shortcut = QShortcut(QKeySequence(key), self)
@@ -417,6 +433,8 @@ class MainWindow(QMainWindow):
             self._refresh_auto_panel()
         elif key == "smart":
             self._refresh_smart_panel()
+        elif key == "autopilot":
+            self._refresh_autopilot_panel()
         elif key == "media":
             if len(self.media_panel.items()) != len(self.project.media):
                 self.media_panel.set_media(self.project.media)
@@ -579,6 +597,7 @@ class MainWindow(QMainWindow):
         self._refresh_captions_panel()
         self._refresh_auto_panel()
         self._refresh_smart_panel()
+        self._refresh_autopilot_panel()
 
         self._push_status(message or f"Opened {project.name}")
         log.info("project loaded into window: %s", project.name)
@@ -1541,12 +1560,17 @@ class MainWindow(QMainWindow):
         self._export_dialog = None
 
     # -------------------------------------------------------------- queue
-    def _enqueue_clips(self, clips: list[Clip]) -> int:
+    def _enqueue_clips(
+        self, clips: list[Clip], smart_crop: bool | None = None
+    ) -> list[ExportJob]:
+        """Queue clips for export; ``smart_crop`` None -> settings default."""
         if self.project is None:
-            return 0
+            return []
         output_dir = self.settings_service.settings.output_dir
         burn = self.settings_service.settings.burn_captions
-        count = 0
+        if smart_crop is None:
+            smart_crop = self.settings_service.settings.smart_crop
+        jobs: list[ExportJob] = []
         for clip in clips:
             captions_srt = self._write_clip_srt(clip) if burn else None
             job = self.queue_worker.enqueue_clip(
@@ -1554,11 +1578,11 @@ class MainWindow(QMainWindow):
                 clip,
                 output_dir=output_dir,
                 captions_srt=captions_srt or "",
-                smart_crop=self.settings_service.settings.smart_crop,
+                smart_crop=smart_crop,
             )
             if job is not None:
-                count += 1
-        return count
+                jobs.append(job)
+        return jobs
 
     def _queue_current_clip(self) -> None:
         if not self._require_project():
@@ -1580,9 +1604,9 @@ class MainWindow(QMainWindow):
             return
         self._sync_settings()
         clips = self._clips_from_project()
-        count = self._enqueue_clips(clips)
+        jobs = self._enqueue_clips(clips)
         self.sidebar.select("queue")
-        self._push_status(f"Queued {count} clips")
+        self._push_status(f"Queued {len(jobs)} clips")
 
     def _on_queue_added(self, job: ExportJob) -> None:
         self.queue_panel.refresh(self.queue_worker.jobs_snapshot())
@@ -1598,8 +1622,10 @@ class MainWindow(QMainWindow):
                 f"Exporting {running.clip_name}  -  "
                 f"{int(running.progress * 100)}%  -  {running.detail}"
             )
+        self._autopilot_check_queue()
 
     def _on_queue_empty(self, done: int, errors: int) -> None:
+        self._autopilot_check_queue()
         if done == 0 and errors == 0:
             return
         parts = []
@@ -2000,6 +2026,9 @@ class MainWindow(QMainWindow):
     def _start_auto_analysis(self) -> None:
         if not self._require_project():
             return
+        if self.autopilot_panel.busy:
+            self._push_status("Autopilot is running - cancel it first")
+            return
         if self._auto_worker is not None and self._auto_worker.isRunning():
             self._push_status("Auto-clip analysis is already running")
             return
@@ -2157,7 +2186,16 @@ class MainWindow(QMainWindow):
         if media is None:
             self._push_status("Select a media file first")
             return
+        created = self._create_clips_for_candidates(media, candidates)
+        if created:
+            self._push_status(f"Added {len(created)} highlight clip(s)")
 
+    def _create_clips_for_candidates(
+        self, media: MediaItem, candidates: list, label: str = "Add highlight"
+    ) -> list[Clip]:
+        """Create timeline clips from highlight candidates (AUTO + autopilot)."""
+        if self.project is None:
+            return []
         order = max((c.order for c in self.project.clips), default=-1)
         aspect = self.status_bar.aspect
         created: list[Clip] = []
@@ -2191,16 +2229,16 @@ class MainWindow(QMainWindow):
                     "type": "clip_add",
                     "clip": clip.model_dump(),
                     "index": len(self.project.clips) - 1,
-                    "label": "Add highlight",
+                    "label": label,
                 }
             )
         if not created:
-            return
+            return []
         self._refresh_timeline()
         self._refresh_clip_list()
         if created[0].id is not None:
             self._select_clip(created[0].id)
-        self._push_status(f"Added {len(created)} highlight clip(s)")
+        return created
 
     def _on_auto_clear(self) -> None:
         self.auto_panel.set_candidates([])
@@ -2281,6 +2319,9 @@ class MainWindow(QMainWindow):
     def _start_smart_analysis(self) -> None:
         if not self._require_project():
             return
+        if self.autopilot_panel.busy:
+            self._push_status("Autopilot is running - cancel it first")
+            return
         if self._smart_worker is not None and self._smart_worker.isRunning():
             self._push_status("Face tracking is already running")
             return
@@ -2332,12 +2373,11 @@ class MainWindow(QMainWindow):
     def _on_smart_progress(self, message: str) -> None:
         self.smart_panel.set_status(message)
 
-    def _on_smart_completed(self, payload: object) -> None:
-        self.smart_panel.set_busy(False)
+    def _save_track_payload(
+        self, media_id: int, payload: object
+    ) -> tuple[list[TrackKeyframe], int]:
+        """Parse and store a face-track payload; returns (keyframes, hits)."""
         data = payload if isinstance(payload, dict) else {}
-        media_id = int(
-            data.get("media_id") or self.smart_panel.selected_media_id() or 0
-        )
         keyframes: list[TrackKeyframe] = []
         for entry in data.get("keyframes") or []:
             try:
@@ -2359,6 +2399,15 @@ class MainWindow(QMainWindow):
                 )
             finally:
                 database.close()
+        return keyframes, hits
+
+    def _on_smart_completed(self, payload: object) -> None:
+        self.smart_panel.set_busy(False)
+        data = payload if isinstance(payload, dict) else {}
+        media_id = int(
+            data.get("media_id") or self.smart_panel.selected_media_id() or 0
+        )
+        keyframes, hits = self._save_track_payload(media_id, payload)
         if hits:
             message = f"Tracked {len(keyframes)} keyframes ({hits} face hits)"
         else:
@@ -2393,6 +2442,324 @@ class MainWindow(QMainWindow):
         self._refresh_smart_track_status()
         self._apply_smart_overlay()
         self._push_status("Face track cleared")
+
+    # ----------------------------------------------------------- autopilot
+    def _refresh_autopilot_panel(self) -> None:
+        if self.project is None or self.autopilot_panel.busy:
+            return
+        preferred = self.current_media.id if self.current_media else None
+        self.autopilot_panel.set_media(self.project.media, preferred)
+        ok, message = smart_availability()
+        self.autopilot_panel.set_track_available(ok, message)
+
+    def _start_autopilot(self) -> None:
+        if not self._require_project():
+            return
+        if self.autopilot_panel.busy or self._autopilot is not None:
+            self._push_status("Autopilot is already running")
+            return
+        if self._auto_worker is not None and self._auto_worker.isRunning():
+            self._push_status("AUTO analysis is running - wait for it first")
+            return
+        if self._smart_worker is not None and self._smart_worker.isRunning():
+            self._push_status("Face tracking is running - wait for it first")
+            return
+        media_id = self.autopilot_panel.selected_media_id()
+        media = (
+            self.project.media_by_id(media_id) if media_id is not None else None
+        )
+        if media is None:
+            self.autopilot_panel.set_status(
+                "Select a media file first", error=True
+            )
+            return
+        if media.duration <= 0:
+            self.autopilot_panel.set_status(
+                "Media duration unknown - reopen the project to probe it",
+                error=True,
+            )
+            return
+        source = media.resolve_path(self.project.directory)
+        if not source.exists():
+            source = Path(media.source_path)
+        if not source.exists():
+            self.autopilot_panel.set_status(
+                f"Source file not found: {media.source_path}", error=True
+            )
+            return
+        min_len = self.autopilot_panel.min_len()
+        max_len = self.autopilot_panel.max_len()
+        if max_len <= min_len:
+            self.autopilot_panel.set_status(
+                "Max clip length must be greater than min", error=True
+            )
+            return
+        cached, language = self._load_transcript(media.id or 0)
+        if not cached and not whisper_available():
+            self.autopilot_panel.set_status(
+                "faster-whisper is not installed and there is no cached "
+                "transcript - run: python -m pip install faster-whisper",
+                error=True,
+            )
+            return
+
+        settings = self.settings_service.settings
+        self._autopilot = {
+            "media": media,
+            "media_id": media.id or 0,
+            "source": source,
+            "track": self.autopilot_panel.track_faces(),
+            "export": self.autopilot_panel.export_when_done(),
+            "exported_track": False,
+            "created": [],
+            "job_ids": [],
+            "early_errors": 0,
+            "stage": "analyze",
+        }
+        self.autopilot_panel.reset_stages()
+        self.autopilot_panel.set_report("")
+        self.autopilot_panel.set_busy(True)
+        self.autopilot_panel.set_stage(0, "running")
+        self.autopilot_panel.set_status("Starting analysis...")
+
+        worker = AutoClipWorker(
+            media_id=media.id or 0,
+            media_path=source,
+            media_duration=media.duration,
+            cached_transcript=cached,
+            cached_language=language,
+            min_len=min_len,
+            max_len=max_len,
+            count=self.autopilot_panel.clip_count(),
+            use_ai=self.autopilot_panel.use_ai(),
+            ollama_url=settings.ollama_url,
+            ollama_model=settings.ollama_model,
+            whisper_model=settings.whisper_model,
+            whisper_language=settings.whisper_language,
+            download_root=cache_dir() / "whisper",
+            ffmpeg=self.ffmpeg,
+            parent=self,
+        )
+        worker.progress.connect(self._on_autopilot_progress)
+        worker.completed.connect(self._on_autopilot_analyzed)
+        worker.error.connect(self._on_autopilot_error)
+        self._autopilot_worker = worker
+        self._track_worker(worker)
+        worker.start()
+        self._push_status("Autopilot started")
+
+    def _cancel_autopilot(self) -> None:
+        run = self._autopilot
+        if run is None:
+            return
+        worker = self._autopilot_worker
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            self.autopilot_panel.set_status("Cancelling...")
+            return
+        if run.get("stage") == "waiting":
+            self.autopilot_panel.set_status("Cancelling queued exports...")
+            for job_id in run.get("job_ids") or []:
+                self.queue_worker.cancel_job(job_id)
+
+    def _on_autopilot_progress(self, message: str) -> None:
+        self.autopilot_panel.set_status(message)
+
+    def _on_autopilot_error(self, message: str) -> None:
+        if self._autopilot is None:
+            return
+        if message == "cancelled":
+            self.autopilot_panel.set_stage(0, "failed", "cancelled")
+            self._finish_autopilot("Autopilot cancelled during analysis.")
+            return
+        self.autopilot_panel.set_stage(0, "failed", message)
+        self._finish_autopilot(f"Autopilot stopped during analysis: {message}")
+
+    def _on_autopilot_analyzed(self, payload: object) -> None:
+        run = self._autopilot
+        if run is None:
+            return
+        data = payload if isinstance(payload, dict) else {}
+        media_id = int(run["media_id"])
+        if data.get("transcribed") and self.project is not None:
+            database = ProjectDatabase(self.project.path)
+            try:
+                TranscriptRepository(database).upsert(
+                    media_id,
+                    list(data.get("transcript") or []),
+                    str(data.get("language") or ""),
+                )
+            finally:
+                database.close()
+            self._refresh_auto_transcript_status()
+
+        candidates = list(data.get("candidates") or [])
+        note = str(data.get("note") or "")
+        if not candidates:
+            message = note or "no highlights found - try a wider min/max range"
+            self.autopilot_panel.set_stage(0, "failed", message)
+            self._finish_autopilot(f"Autopilot stopped: {message}.")
+            return
+        created = self._create_clips_for_candidates(
+            run["media"], candidates, label="Autopilot add"
+        )
+        if not created:
+            self.autopilot_panel.set_stage(
+                0, "failed", "clips could not be created"
+            )
+            self._finish_autopilot(
+                "Autopilot stopped: clips could not be created."
+            )
+            return
+        run["created"] = created
+        source = "transcribed" if data.get("transcribed") else "cached transcript"
+        detail = f"{len(candidates)} highlights -> {len(created)} clips ({source})"
+        if note:
+            detail += f"; {note}"
+        self.autopilot_panel.set_stage(0, "done", detail)
+
+        if run.get("track"):
+            ok, message = smart_availability()
+            if ok:
+                self._start_autopilot_track(run)
+                return
+            self.autopilot_panel.set_stage(1, "skipped", message)
+        else:
+            self.autopilot_panel.set_stage(1, "skipped", "disabled")
+        self._autopilot_enqueue(run)
+
+    def _start_autopilot_track(self, run: dict) -> None:
+        run["stage"] = "track"
+        self.autopilot_panel.set_stage(1, "running")
+        self.autopilot_panel.set_status("Tracking faces...")
+        worker = SmartTrackWorker(
+            media_id=int(run["media_id"]),
+            media_path=Path(run["source"]),
+            duration=float(run["media"].duration),
+            parent=self,
+        )
+        worker.progress.connect(self._on_autopilot_progress)
+        worker.completed.connect(self._on_autopilot_tracked)
+        worker.error.connect(self._on_autopilot_track_error)
+        self._autopilot_worker = worker
+        self._track_worker(worker)
+        worker.start()
+
+    def _on_autopilot_tracked(self, payload: object) -> None:
+        run = self._autopilot
+        if run is None:
+            return
+        keyframes, hits = self._save_track_payload(int(run["media_id"]), payload)
+        run["exported_track"] = bool(keyframes) and hits > 0
+        self._refresh_smart_track_status()
+        self._apply_smart_overlay()
+        if run["exported_track"]:
+            detail = f"{len(keyframes)} keyframes ({hits} hits)"
+        else:
+            detail = "no faces - center crop"
+        self.autopilot_panel.set_stage(1, "done", detail)
+        self._autopilot_enqueue(run)
+
+    def _on_autopilot_track_error(self, message: str) -> None:
+        run = self._autopilot
+        if run is None:
+            return
+        if message == "cancelled":
+            self.autopilot_panel.set_stage(1, "failed", "cancelled")
+            self._finish_autopilot("Autopilot cancelled during face tracking.")
+            return
+        log.warning("autopilot face track failed: %s", message)
+        self.autopilot_panel.set_stage(1, "failed", message)
+        self._autopilot_enqueue(run)  # tracking is optional - keep going
+
+    def _autopilot_enqueue(self, run: dict) -> None:
+        run["stage"] = "export"
+        created = list(run.get("created") or [])
+        track_note = (
+            ", face track saved" if run.get("exported_track") else ""
+        )
+        if not run.get("export"):
+            self.autopilot_panel.set_stage(2, "skipped", "disabled")
+            self._finish_autopilot(
+                f"Autopilot done: {len(created)} clip(s) added"
+                f"{track_note}. Exports skipped (disabled)."
+            )
+            return
+        self.autopilot_panel.set_stage(
+            2, "running", f"queueing {len(created)} clips..."
+        )
+        smart = True if run.get("exported_track") else None
+        jobs = self._enqueue_clips(created, smart_crop=smart)
+        early_errors = sum(1 for job in jobs if job.status == JOB_ERROR)
+        run["early_errors"] = early_errors
+        job_ids = [job.id for job in jobs if job.status != JOB_ERROR]
+        run["job_ids"] = job_ids
+        if not job_ids:
+            self.autopilot_panel.set_stage(
+                2, "failed", f"{early_errors} failed to queue"
+            )
+            self._finish_autopilot(
+                "Autopilot stopped: exports could not be queued."
+            )
+            return
+        run["stage"] = "waiting"
+        finished = early_errors
+        detail = f"{finished}/{len(jobs)} finished"
+        if early_errors:
+            detail += f", {early_errors} failed to queue"
+        self.autopilot_panel.set_stage(2, "running", detail)
+        self.autopilot_panel.set_status("Waiting for exports...")
+        self._autopilot_check_queue()
+
+    def _autopilot_check_queue(self) -> None:
+        run = self._autopilot
+        if not run or run.get("stage") != "waiting":
+            return
+        job_ids = list(run.get("job_ids") or [])
+        snapshots = {job.id: job for job in self.queue_worker.jobs_snapshot()}
+        missing = [job_id for job_id in job_ids if job_id not in snapshots]
+        if missing:
+            # jobs vanish only when the queue was cleared mid-run
+            self.autopilot_panel.set_stage(2, "failed", "queue was cleared")
+            self._finish_autopilot(
+                "Autopilot stopped: the queue was cleared mid-run."
+            )
+            return
+        jobs = [snapshots[job_id] for job_id in job_ids]
+        done = sum(1 for job in jobs if job.status == JOB_DONE)
+        errors = sum(1 for job in jobs if job.status == JOB_ERROR)
+        cancelled = sum(1 for job in jobs if job.status == JOB_CANCELLED)
+        finished = done + errors + cancelled
+        if finished < len(jobs):
+            detail = f"{finished}/{len(jobs) + int(run.get('early_errors') or 0)} finished"
+            if errors:
+                detail += f", {errors} failed"
+            self.autopilot_panel.set_stage(2, "running", detail)
+            return
+        early = int(run.get("early_errors") or 0)
+        if errors or cancelled or early:
+            detail = (
+                f"{done} exported, {errors + early} failed, {cancelled} cancelled"
+            )
+            self.autopilot_panel.set_stage(2, "failed", detail)
+            report = f"Autopilot finished with errors: {detail}."
+        else:
+            self.autopilot_panel.set_stage(2, "done", f"{done} exported")
+            report = (
+                f"Autopilot done: {len(run.get('created') or [])} clip(s) added"
+                f"{', face track saved' if run.get('exported_track') else ''}"
+                f" - {done} exported."
+            )
+        self._finish_autopilot(report)
+
+    def _finish_autopilot(self, report: str) -> None:
+        self._autopilot_worker = None
+        self._autopilot = None
+        self.autopilot_panel.set_busy(False)
+        self.autopilot_panel.set_status("")
+        self.autopilot_panel.set_report(report)
+        self._push_status(report)
+        log.info(report)
 
     # ------------------------------------------------------------ guards
     def _typing_focus(self) -> bool:
@@ -2499,6 +2866,9 @@ class MainWindow(QMainWindow):
         if self._smart_worker is not None and self._smart_worker.isRunning():
             self._smart_worker.cancel()
             self._smart_worker.wait(4000)
+        if self._autopilot_worker is not None and self._autopilot_worker.isRunning():
+            self._autopilot_worker.cancel()
+            self._autopilot_worker.wait(4000)
         self.queue_worker.shutdown()
         for worker in list(self._bg_workers):
             if worker.isRunning():

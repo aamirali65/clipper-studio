@@ -40,6 +40,11 @@ via OpenCV, no cloud), stores a focus track in the project, shows the framing
 and export crop window live on the preview, and exports that follow the
 tracked subject via an FFmpeg sendcmd crop instead of always center-cropping.
 
+Phase 8 autopilot: the AUTOPILOT page runs the whole pipeline for one media
+file with a single click - transcribe (first time) + find highlights, add
+them as clips, track faces for smart crop, then queue the exports - with a
+stage-by-stage progress report and cancel at every stage.
+
 ## Requirements
 
 - Windows 10/11
@@ -117,6 +122,7 @@ python tests\test_captions.py        # SRT round-trip, caption DB, burn-in expor
 python tests\test_ai.py              # prompt builders, Ollama service, AI page, live chat (skips if no server)
 python tests\test_autoclip.py        # highlight units/scoring/NMS, transcript cache, AUTO page, real worker run
 python tests\test_smartcrop.py       # crop math/sendcmd, track DB, SMART page, real face track + FFmpeg export
+python tests\test_autopilot.py       # autopilot page, full analyze-only run, queue-wait reports, enqueue flags
 ```
 
 Tests expect `output\sample_video.mp4`; it is generated automatically by
@@ -207,6 +213,21 @@ so what you see on the timeline is exactly what gets exported.
    window over the clip; media without a track (or without faces) fall back
    to the classic center crop
 
+### Autopilot (Phase 8)
+
+1. Open the **AUTOPILOT** page, pick a media file, set min/max clip length,
+   clip count and (optionally) AI rank - the same options as the AUTO page
+2. Tick what the run should do: **Track faces before export** and
+   **Export the new clips when done** (captions burn-in and smart crop
+   follow the SETTINGS page), then press **Run autopilot**
+3. The stage list updates live: find + add clips (transcribing on the first
+   run, cached afterwards), face track, then the export queue with a
+   finished/total counter
+4. **Cancel** stops the current stage; during the export stage it cancels
+   the run's queued jobs too
+5. A report line summarizes the run (clips added, track saved, exported /
+   failed counts); the new clips are on the timeline like hand-added ones
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -236,7 +257,7 @@ clipper-studio/
 │   ├── ui/                  # widgets only (no shell commands, no SQL)
 │   │   ├── main_window.py   # composition, actions, shortcuts, orchestration
 │   │   ├── dashboard.py     # startup screen + recent projects
-│   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / AUTO / SMART / EXPORT nav
+│   │   ├── sidebar.py       # MEDIA / PROJECT / EDITOR / CAPTIONS / AI / AUTO / SMART / AUTOPILOT / EXPORT nav
 │   │   ├── media_panel.py   # import + YouTube download + media cards
 │   │   ├── video_player.py  # QMediaPlayer preview + aspect framing overlay
 │   │   ├── timeline.py      # multi-clip timeline: split/move/drag, zoom, undo support
@@ -248,6 +269,7 @@ clipper-studio/
 │   │   ├── ai_panel.py      # AI page: local Ollama chat + quick actions
 │   │   ├── auto_panel.py    # AUTO page: highlight search + review + add clips
 │   │   ├── smart_panel.py   # SMART page: face track analysis + preview overlay
+│   │   ├── autopilot_panel.py # AUTOPILOT page: one-click pipeline + stage report
 │   │   ├── export_dialog.py # export options + progress + open folder
 │   │   ├── project_dialog.py# new project dialog
 │   │   ├── status_bar.py    # timecode, aspect, export button
@@ -310,6 +332,9 @@ workspace can be moved as long as external media files are relocated too.
 - Smart crop tracks faces (YuNet), not arbitrary subjects: a media where the
   face leaves the frame, or faceless footage, falls back to center-cropping;
   tracking samples ~1.5 fps, so very fast motion can lag slightly.
+- Autopilot runs one media per run and reuses the session-scoped export
+  queue; exports queued by a run behave like manual queue jobs (they are
+  not persisted across restarts).
 - YouTube download uses yt-dlp defaults (no cookies, no API key). Private or
   region-locked videos will fail with the reported yt-dlp error.
 - Paths are resolved from the repository root (or the frozen EXE folder);

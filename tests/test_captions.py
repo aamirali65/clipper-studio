@@ -271,7 +271,7 @@ def test_gui_captions_page() -> None:
     window._confirm_discard = lambda: True
 
     assert window.sidebar._buttons["captions"].isEnabled(), "captions page disabled"
-    assert window.pages.count() == 10, window.pages.count()
+    assert window.pages.count() == 11, window.pages.count()
     window.sidebar.select("captions")
     assert window.pages.currentIndex() == 6
 

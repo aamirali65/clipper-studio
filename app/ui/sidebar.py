@@ -13,6 +13,7 @@ PAGES = [
     ("ai", "AI", True),
     ("auto", "AUTO", True),
     ("smart", "SMART", True),
+    ("autopilot", "AUTOPILOT", True),
     ("export", "EXPORT", True),
     ("queue", "QUEUE", True),
     ("settings", "SETTINGS", True),
@@ -64,7 +65,7 @@ class Sidebar(QWidget):
 
         layout.addStretch(1)
 
-        version = QLabel("Phase 7")
+        version = QLabel("Phase 8")
         version.setStyleSheet("color: #4d4d55; font-size: 10px; padding-left: 6px;")
         layout.addWidget(version)
 
