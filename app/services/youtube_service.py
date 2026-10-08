@@ -170,6 +170,9 @@ class YouTubeService:
             "fragment_retries": 3,
             "writethumbnail": False,
             "windowsfilenames": True,
+            # YouTube extraction needs a JS runtime; deno is the default but
+            # is often missing - node is enabled too when installed
+            "js_runtimes": {"node": {}},
         }
         log.info("downloading %s -> %s", url, target_dir)
         before = set(target_dir.glob("*"))
