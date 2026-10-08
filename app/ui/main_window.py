@@ -2567,7 +2567,11 @@ class MainWindow(QMainWindow):
         if not source.exists():
             source = Path(media.source_path)
         self._autopilot = self._autopilot_new_run(
-            media=media, source=source, min_len=min_len, max_len=max_len
+            media=media,
+            media_id=media.id or 0,
+            source=source,
+            min_len=min_len,
+            max_len=max_len,
         )
         self._autopilot_begin_analysis()
 

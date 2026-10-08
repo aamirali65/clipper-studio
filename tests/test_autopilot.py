@@ -127,6 +127,9 @@ def test_gui_autopilot_page() -> None:
         window._start_autopilot()
         assert panel.busy is True
         assert window._autopilot is not None
+        assert window._autopilot["media_id"] == project.media[0].id, (
+            "local run must carry the media id for transcript/track saves"
+        )
         assert panel.stage_text(0).startswith(">"), panel.stage_text(0)
         worker = window._autopilot_worker
         assert worker is not None
